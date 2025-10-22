@@ -34,19 +34,53 @@ typedef enum
     STOP
 } State;
 
+int nTries = 3;
+int timeout = 3;
+static unsigned char s_ns = 0;
+static LinkLayerRole storedRole = LlTx;
+
+static unsigned char bcc2Calc(const unsigned char *data, int len)
+{
+    unsigned char bcc2 = 0x00;
+    for (int i = 0; i < len; i++)
+        bcc2 ^= data[i];
+    return bcc2;
+}
+
+static void stuffFunc(unsigned char byte, unsigned char *out, int *outLen)
+{
+    if (byte == 0x7E)
+    {
+        out[(*outLen)++] = 0x7D;
+        out[(*outLen)++] = 0x5E;
+    }
+    else if (byte == 0x7D)
+    {
+        out[(*outLen)++] = 0x7D;
+        out[(*outLen)++] = 0x5D;
+    }
+    else
+    {
+        out[(*outLen)++] = byte;
+    }
+}
+
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
 int llopen(LinkLayer connectionParameters)
 {
-    // TODO: Implement this function
+    nTries = connectionParameters.nRetransmissions;
+    timeout = connectionParameters.timeout;
+    storedRole = connectionParameters.role;
+
     if (openSerialPort(connectionParameters.serialPort, connectionParameters.baudRate) == -1)
     {
         fprintf(stderr, "Could not open serial port. Try again.\n");
         return -1;
     }
 
-    if (connectionParameters.role == LlTx)
+    if (storedRole == LlTx)
     {
         setupAlarm();
 
@@ -61,13 +95,14 @@ int llopen(LinkLayer connectionParameters)
         int tries = 0;
         int gotUA = 0;
 
-        while (!gotUA && tries < connectionParameters.nRetransmissions)
+        while (!gotUA && tries < nTries)
         {
-            if (writeBytesSerialPort(setFrame, 5) != 5) {
+            if (writeBytesSerialPort(setFrame, 5) != 5)
+            {
                 printf("write SET failed\n");
             }
 
-            startAlarm(connectionParameters.timeout);
+            startAlarm(timeout);
 
             State state = START;
 
@@ -75,9 +110,11 @@ int llopen(LinkLayer connectionParameters)
             {
                 unsigned char byte;
                 int r = readByteSerialPort(&byte);
-                
-                if (r < 0) continue;
-                if (r == 0) continue;
+
+                if (r < 0)
+                    continue;
+                if (r == 0)
+                    continue;
 
                 printf("Byte received: 0x%02x\n", byte);
 
@@ -132,7 +169,8 @@ int llopen(LinkLayer connectionParameters)
                 tries++;
         }
 
-        if(!gotUA) {
+        if (!gotUA)
+        {
             printf("llopen (Tx): UA not received after %d retries\n", connectionParameters.nRetransmissions);
             closeSerialPort();
             return -1;
@@ -148,9 +186,11 @@ int llopen(LinkLayer connectionParameters)
         {
             unsigned char byte;
             int r = readByteSerialPort(&byte);
-            
-            if(r < 0) continue;
-            if (r == 0) continue;
+
+            if (r < 0)
+                continue;
+            if (r == 0)
+                continue;
 
             printf("Byte received: 0x%02X\n", byte);
 
@@ -194,7 +234,6 @@ int llopen(LinkLayer connectionParameters)
             }
         }
 
-
         unsigned char ua[5];
 
         ua[0] = FLAG;
@@ -222,8 +261,139 @@ int llopen(LinkLayer connectionParameters)
 int llwrite(const unsigned char *buf, int bufSize)
 {
     // TODO: Implement this function
+    if (bufSize <= 0)
+        return 0;
 
-    return 0;
+    const unsigned char C = (s_ns == 0) ? 0x00 : 0x80;
+    const unsigned char A = ADDRESS_SENDER;
+    const unsigned char B1 = BCC1(A, C);
+    const unsigned char B2 = bcc2Calc(buf, bufSize);
+
+    const unsigned maxStuff = 6 + 2 * bufSize + 6;
+    unsigned char frame[2 + maxStuff];
+    int L = 0;
+
+    frame[L++] = FLAG;
+    stuffFunc(A, frame, &L);
+    stuffFunc(C, frame, &L);
+    stuffFunc(B1, frame, &L);
+
+    for (int i = 0; i < bufSize; i++)
+        stuffFunc(buf[i], frame, &L);
+    stuffFunc(B2, frame, &L);
+
+    frame[L++] = FLAG;
+
+    setupAlarm();
+    int tries = 0;
+
+    while (tries <= nTries)
+    {
+        if (writeBytesSerialPort(frame, L) != L)
+        {
+            // falha de escrita -> tenta de novo sem gastar tentativa (opcional)
+            continue;
+        }
+
+        startAlarm(timeout);
+
+        // RR confirma a PRÓXIMA Ns (Nr = s_ns ^ 1)
+        unsigned char rrExpected = (s_ns == 0) ? RR1 : RR0;
+        // REJ pede retransmissões da Ns atual (Nr = s_ns)
+        unsigned char rejExpected = (s_ns == 0) ? REJ0 : REJ1;
+
+        // ler bytes e fazer *state machine* de S/U (FLAG A C BCC1 FLAG)
+        State state = START;
+        unsigned char byte = 0;
+        unsigned char lastA = 0; //* WHY?
+        unsigned char lastC = 0; //* WHY?
+
+        while (alarmEnabled)
+        {
+            int r = readByteSerialPort(&byte);
+            if (r <= 0)
+                continue;
+
+            switch (state)
+            {
+            case START:
+                if (byte == FLAG)
+                    state = FLAG_RCV;
+                break;
+
+            case FLAG_RCV:
+                if (byte == ADDRESS_RECEIVER) {
+                    lastA = byte;
+                    state = A_RCV;
+                }
+                else if (byte != FLAG)
+                    state = START;
+                break;
+
+            case A_RCV:
+                lastC = byte; // pode ser RR*/REJ*/DISC/UA (embora aqui esperemos RR/REJ)
+                // Aceita RR ou REJ esperados; outros controlos são ignorados em baixo
+                if (byte == rrExpected || byte == rejExpected || byte == DISC || byte == UA)
+                    state = C_RCV;
+                else if (byte == FLAG)
+                    state = FLAG_RCV;
+                else
+                    state = START;
+                break;
+
+            case C_RCV:
+                // validar BCC1 = A ^ C
+                if (byte == BCC1(lastA, lastC))
+                    state = BCC_OK;
+                else
+                    state = START;
+                break;
+
+            case BCC_OK:
+                if (byte == FLAG)
+                    state = STOP;
+                else
+                    state = START;
+                break;
+
+            default:
+                break;
+            }
+
+            if (state == STOP)
+                break;
+        }
+
+        stopAlarm();
+
+        if (state == STOP) {
+            if (lastC == rrExpected) {
+                // sucesso -> alterna Ns e devolve bytes enviados
+                s_ns ^= 1;
+                return bufSize;
+            }
+            if (lastC == rejExpected) {
+                // recetor detetou erro -> retransmitir (consome tentativa)
+                tries++;
+                continue;
+            }
+            if (lastC == DISC) {
+                // recetor a fechar inesperadamente
+                return -1;
+            }
+            // outro controlo (p.ex., UA ou RR "errado"): trata como falta de resposta útil
+            tries++;
+            continue;
+        }
+        else {
+            // timeout
+            tries++;
+            continue;
+        }
+    }
+
+    // excedeu retransmissões
+    return -1;
 }
 
 ////////////////////////////////////////////////
