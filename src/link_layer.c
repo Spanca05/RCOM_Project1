@@ -65,6 +65,8 @@ static void stuffFunc(unsigned char byte, unsigned char *out, int *outLen)
     }
 }
 
+// TODO: Implement unstuffFunc and use it when checking the values (I don't know yet how that will happen)
+
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
@@ -260,9 +262,9 @@ int llopen(LinkLayer connectionParameters)
 ////////////////////////////////////////////////
 int llwrite(const unsigned char *buf, int bufSize)
 {
-    // TODO: Implement this function
+    // Validate input
     if (bufSize <= 0)
-        return 0;
+        return -1;
 
     const unsigned char C = (s_ns == 0) ? 0x00 : 0x80;
     const unsigned char A = ADDRESS_SENDER;
@@ -287,7 +289,8 @@ int llwrite(const unsigned char *buf, int bufSize)
     setupAlarm();
     int tries = 0;
 
-    while (tries <= nTries)
+    /* follow the same retry semantics as llopen (tries < nTries) */
+    while (tries < nTries)
     {
         if (writeBytesSerialPort(frame, L) != L)
         {
