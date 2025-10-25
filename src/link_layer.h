@@ -6,10 +6,9 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #define _POSIX_SOURCE 1 // POSIX compliant source
-#define FALSE 0
-#define TRUE 1
 #define BAUDRATE 38400
 #define BUF_SIZE 256
 #define MAX_PAYLOAD_SIZE 1000
