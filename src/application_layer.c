@@ -8,6 +8,49 @@
 
 #define BUFFER_SIZE 512
 
+long int getFileSize(FILE* file) {
+    long int size;
+    long int current = ftell(file);
+    fseek(file, 0, SEEK_END);
+    size = ftell(file);
+    fseek(file, current, SEEK_SET);
+    return size;
+}
+
+unsigned char * getData(FILE *file, long int fileLength) {
+    unsigned char* content = (unsigned char*)malloc(sizeof(unsigned char) * fileLength);
+    fread(content, sizeof(unsigned char), fileLength, file);
+    return content;
+}
+
+unsigned char * getControlPacket(int controlField, const char *filename, long int fileSize, size_t *packetSize) {
+    size_t index = 0;
+    size_t size = 1 + (1 + 1 + sizeof(long)) + (1 + 1 + strlen(filename));
+    
+    unsigned char * packet = malloc(size);
+    if(packet == NULL) {
+        printf("Error: Insufficient memory to allocate %zu bytes\n", size);
+        return NULL;
+    }
+
+    packet[index++] = controlField;
+
+    // Parameter size
+    packet[index++] = 0;
+    packet[index++] = sizeof(long);
+    memcpy(&packet[index], &fileSize, sizeof(long));
+    index += sizeof(long);
+
+    // Parameter filename
+    packet[index++] = 1;
+    packet[index++] = strlen(filename);
+    memcpy(&packet[index], filename, strlen(filename));
+    index += strlen(filename);
+
+    *packetSize = size;
+    return packet;
+}
+
 void applicationLayer(const char *serialPort, const char *role, int baudRate,
                       int nTries, int timeout, const char *filename)
 {
@@ -34,15 +77,12 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
             return;
         }
 
-        unsigned char buf[BUFFER_SIZE];
-        size_t n;
+        long int fileSize = getFileSize(file);
+        unsigned char* content = getData(file, fileSize);
 
-        while((n = fread(buf, 1, sizeof buf, file)) > 0) {
-            if(llwrite(buf, n) < 0) {
-                printf("Error writing\n");
-                break;
-            }
-        }
+        unsigned char buf[BUFFER_SIZE];
+
+        
 
         fclose(file);
 
