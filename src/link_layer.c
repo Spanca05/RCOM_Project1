@@ -100,11 +100,14 @@ void resetUnStuffState(UnStuffState *state)
     state->escPending = 0;
 }
 
+// TODO: Implementar sendSupervisionFrame para código ficar mais modular e se perceber melhor
+
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
 int llopen(LinkLayer connectionParameters)
 {
+    // TODO: Falta implementar stuff e unStuff (é mesmo preciso?)
     nTries = connectionParameters.nRetransmissions;
     timeout = connectionParameters.timeout;
     storedRole = connectionParameters.role;
@@ -307,7 +310,7 @@ int llwrite(const unsigned char *buf, int bufSize)
     // Worst case: FLAG + 2 * (A, C, BCC1, payload, BCC2) + FLAG
     const unsigned maxFrameSize = 1 + 2 * (4 + bufSize) + 1;
     unsigned char frame[maxFrameSize];
-    int frameLen = 0;
+    size_t frameLen = 0;
 
     frame[frameLen++] = FLAG;
     TRY(stuffFunc(addressField, frame, &frameLen, maxFrameSize));
@@ -401,8 +404,6 @@ int llwrite(const unsigned char *buf, int bufSize)
             case BCC_OK:
                 if (rxByte == FLAG)
                     state = STOP;
-                else if (rxByte == FLAG)
-                    state = FLAG_RCV;
                 else
                     state = START;
                 break;
@@ -468,6 +469,130 @@ int llread(unsigned char *packet)
 int llclose()
 {
     // TODO: Implement this function
+    if (storedRole == LlTx)
+    {
+        const unsigned char addressField = ADDRESS_SENDER;
+        const unsigned char controlField = DISC;
+        const unsigned char bcc1 = BCC1(addressField, controlField);
 
+    unsigned char discFrame[8];
+    size_t discLen = 0;
+    discFrame[discLen++] = FLAG;
+    TRY(stuffFunc(addressField, discFrame, &discLen, sizeof(discFrame)));
+    TRY(stuffFunc(controlField, discFrame, &discLen, sizeof(discFrame)));
+    TRY(stuffFunc(bcc1, discFrame, &discLen, sizeof(discFrame)));
+    discFrame[discLen++] = FLAG;
+
+        int tries = 0;
+        int gotDISC = 0;
+
+        UnStuffState unStuffState;
+        setupAlarm();
+
+        while (!gotDISC && tries < nTries)
+        {
+            if (writeBytesSerialPort(discFrame, discLen) != discLen)
+            {
+                tries++;
+                continue;
+            }
+
+            resetUnStuffState(&unStuffState);
+            startAlarm(timeout);
+
+            State state = START;
+            unsigned char lastA = 0, lastC = 0;
+
+            while (state != STOP && alarmEnabled)
+            {
+                unsigned char byte;
+                int res = unStuffByteFromSerial(&byte, &unStuffState);
+                if (res <= 0)
+                    continue;
+
+                printf("Byte received: 0x%02x\n", byte);
+
+                switch (state)
+                {
+                case START:
+                    if (byte == FLAG)
+                        state = FLAG_RCV;
+                    break;
+
+                case FLAG_RCV:
+                    if (byte == ADDRESS_RECEIVER) {
+                        lastA = byte;
+                        state = A_RCV;
+                    }
+                    else if (byte != FLAG)
+                        state = START;
+                    break;
+
+                case A_RCV:
+                    lastC = byte; //! Porque é que é aqui e não dentro do if?
+                    if (byte == DISC)
+                        state = C_RCV;
+                    else if (byte == FLAG)
+                        state = FLAG_RCV;
+                    else
+                        state = START;
+                    break;
+
+                case C_RCV:
+                    if (byte == BCC1(lastA, lastC))
+                        state = BCC_OK;
+                    else
+                        state = START;
+                    break;
+
+                case BCC_OK:
+                    if (byte == FLAG)
+                        state = STOP;
+                    else
+                        state = START;
+                    break;
+
+                default:
+                    break;
+                }
+            }
+
+            if (state == STOP && lastA == ADDRESS_RECEIVER && lastC == DISC)
+            {
+                gotDISC = 1;
+                stopAlarm();
+                break;
+            }
+
+            tries++;
+        }
+
+        if (!gotDISC)
+        {
+            printf("llclose (Tx): DISC not received after %d retries\n", tries);
+            closeSerialPort();
+            return -1;
+        }
+
+        // Envia UA final (stuffed)
+        const unsigned char C_UA = UA;
+        const unsigned char B1_UA = BCC1(addressField, C_UA);
+
+        unsigned char uaFrame[8];
+        size_t uaLen = 0;
+
+        uaFrame[uaLen++] = FLAG;
+        TRY(stuffFunc(addressField, uaFrame, &uaLen, sizeof(uaFrame)));
+        TRY(stuffFunc(C_UA, uaFrame, &uaLen, sizeof(uaFrame)));
+        TRY(stuffFunc(B1_UA, uaFrame, &uaLen, sizeof(uaFrame)));
+        uaFrame[uaLen++] = FLAG;
+
+        writeBytesSerialPort(uaFrame, uaLen);
+        
+        closeSerialPort();
+        return 0;
+    }
+    // TODO: Implementar para o receiver
+    else {}
     return 0;
 }

@@ -159,8 +159,8 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
             return;
         }
 
-        unsigned char buf[MAX_PAYLOAD_SIZE];
-        unsigned char * packet;
+        //unsigned char buf[MAX_PAYLOAD_SIZE];
+        //unsigned char * packet;
 
         while (1) {}
 
