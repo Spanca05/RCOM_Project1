@@ -1,38 +1,8 @@
 // Link layer protocol implementation
 
-#include <stdio.h>
-
 #include "link_layer.h"
 #include "serial_port.h"
 #include "alarm.h"
-
-// MISC
-#define _POSIX_SOURCE 1 // POSIX compliant source
-
-#define FALSE 0
-#define TRUE 1
-
-#define FLAG 0x7E
-#define ADDRESS_SENDER 0x03
-#define ADDRESS_RECEIVER 0x01
-#define SET 0x03
-#define UA 0x07
-#define RR0 0xAA
-#define RR1 0xAB
-#define REJ0 0x54
-#define REJ1 0x55
-#define DISC 0x0B
-#define BCC1(a, c) ((a) ^ (c))
-
-typedef enum
-{
-    START,
-    FLAG_RCV,
-    A_RCV,
-    C_RCV,
-    BCC_OK,
-    STOP
-} State;
 
 int nTries = 3;
 int timeout = 3;
@@ -47,25 +17,88 @@ static unsigned char bcc2Calc(const unsigned char *data, int len)
     return bcc2;
 }
 
-static void stuffFunc(unsigned char byte, unsigned char *out, int *outLen)
+// Safer stuffing: escreve no buffer de saída mantendo controle de capacidade.
+// Retorna o novo outLen (>=0) ou -1 em caso de overflow.
+static int stuffFunc(unsigned char inputByte, unsigned char *outBuffer, size_t *outLen, size_t outCap)
 {
-    if (byte == 0x7E)
+    if (inputByte == FLAG || inputByte == ESC)
     {
-        out[(*outLen)++] = 0x7D;
-        out[(*outLen)++] = 0x5E;
-    }
-    else if (byte == 0x7D)
-    {
-        out[(*outLen)++] = 0x7D;
-        out[(*outLen)++] = 0x5D;
+        if ((*outLen) + 2 > outCap)
+            return -1;
+        outBuffer[(*outLen)++] = 0x7D;
+        outBuffer[(*outLen)++] = (unsigned char)(inputByte ^ 0x20); // O XOR retorna um signed char?
     }
     else
     {
-        out[(*outLen)++] = byte;
+        if ((*outLen) + 1 > outCap)
+            return -1;
+        outBuffer[(*outLen)++] = inputByte;
     }
+
+    return 0;
 }
 
-// TODO: Implement unstuffFunc and use it when checking the values (I don't know yet how that will happen)
+// Un-stuffing: converte sequências escapadas (0x7D 0x5E -> 0x7E, 0x7D 0x5D -> 0x7D)
+// in: buffer de entrada (possivelmente com escapes), inLen: tamanho da entrada
+// out: buffer destino, outCap: capacidade de out
+// Retorna número de bytes escritos em out, ou -1 em caso de erro (escape truncado ou overflow)
+static int unStuffFunc(const unsigned char *inBuffer, size_t inLen, unsigned char *outBuffer, size_t outCap)
+{
+    // TODO: Fazer eu a função e percebê-la
+    int outIndex = 0;
+
+    for (int inIndex = 0; inIndex < inLen; inIndex++)
+    {
+        unsigned char currByte = inBuffer[inIndex];
+
+        if (currByte == ESC)
+        {
+            // precisa existir um próximo byte
+            if (inIndex + 1 >= inLen)
+                return -1; // escape truncado
+
+            unsigned char nextByte = inBuffer[++inIndex];
+            //! Inverso do stuffing (XOR seguido de XOR cancela-se?)
+            currByte = (unsigned char)(nextByte ^ 0x20);
+        }
+
+        if (outIndex + 1 > outCap)
+            return -1; // overflow
+        outBuffer[outIndex++] = currByte;
+    }
+
+    return outIndex;
+}
+
+static int unStuffByteFromSerial(unsigned char *out, UnStuffState *state)
+{
+    unsigned char rx;
+    int r = readByteSerialPort(&rx);
+    if (r <= 0)
+        return -1;
+
+    if (state->escPending)
+    {
+        state->escPending = 0;
+        *out = (unsigned char)(rx ^ 0x20);
+        return 1;
+    }
+
+    if (rx == ESC)
+    {
+        state->escPending = 1;
+        return 0;
+    }
+
+    // If rx == FLAG, it's still FLAG
+    *out = rx;
+    return 1;
+}
+
+void resetUnStuffState(UnStuffState *state)
+{
+    state->escPending = 0;
+}
 
 ////////////////////////////////////////////////
 // LLOPEN
@@ -111,11 +144,11 @@ int llopen(LinkLayer connectionParameters)
             while (state != STOP && alarmEnabled)
             {
                 unsigned char byte;
-                int r = readByteSerialPort(&byte);
+                int res = readByteSerialPort(&byte);
 
-                if (r < 0)
+                if (res < 0)
                     continue;
-                if (r == 0)
+                if (res == 0)
                     continue;
 
                 printf("Byte received: 0x%02x\n", byte);
@@ -266,95 +299,110 @@ int llwrite(const unsigned char *buf, int bufSize)
     if (bufSize <= 0)
         return -1;
 
-    const unsigned char C = (s_ns == 0) ? 0x00 : 0x80;
-    const unsigned char A = ADDRESS_SENDER;
-    const unsigned char B1 = BCC1(A, C);
-    const unsigned char B2 = bcc2Calc(buf, bufSize);
+    const unsigned char controlField = (s_ns == 0) ? 0x00 : 0x80;
+    const unsigned char addressField = ADDRESS_SENDER;
+    const unsigned char bcc1 = BCC1(addressField, controlField);
+    const unsigned char bcc2 = bcc2Calc(buf, bufSize);
 
-    const unsigned maxStuff = 6 + 2 * bufSize + 6;
-    unsigned char frame[2 + maxStuff];
-    int L = 0;
+    // Worst case: FLAG + 2 * (A, C, BCC1, payload, BCC2) + FLAG
+    const unsigned maxFrameSize = 1 + 2 * (4 + bufSize) + 1;
+    unsigned char frame[maxFrameSize];
+    int frameLen = 0;
 
-    frame[L++] = FLAG;
-    stuffFunc(A, frame, &L);
-    stuffFunc(C, frame, &L);
-    stuffFunc(B1, frame, &L);
+    frame[frameLen++] = FLAG;
+    TRY(stuffFunc(addressField, frame, &frameLen, maxFrameSize));
+    TRY(stuffFunc(controlField, frame, &frameLen, maxFrameSize));
+    TRY(stuffFunc(bcc1, frame, &frameLen, maxFrameSize));
 
-    for (int i = 0; i < bufSize; i++)
-        stuffFunc(buf[i], frame, &L);
-    stuffFunc(B2, frame, &L);
+    for (size_t payloadIndex = 0; payloadIndex < bufSize; payloadIndex++)
+        TRY(stuffFunc(buf[payloadIndex], frame, &frameLen, maxFrameSize));
 
-    frame[L++] = FLAG;
+    TRY(stuffFunc(bcc2, frame, &frameLen, maxFrameSize));
+
+    if (frameLen + 1 > maxFrameSize)
+        return -1;
+    frame[frameLen++] = FLAG;
 
     setupAlarm();
-    int tries = 0;
+    int attemptCount = 0;
 
-    /* follow the same retry semantics as llopen (tries < nTries) */
-    while (tries < nTries)
+    UnStuffState unStuffState;
+    resetUnStuffState(&unStuffState);
+
+    /* follow the same retry semantics as llopen (attemptCount < nTries) */
+    while (attemptCount < nTries)
     {
-        if (writeBytesSerialPort(frame, L) != L)
+        resetUnStuffState(&unStuffState);
+        if (writeBytesSerialPort(frame, frameLen) != frameLen)
         {
-            // falha de escrita -> tenta de novo sem gastar tentativa (opcional)
+            // write failure -> try again without consuming a retry (optional)
             continue;
         }
 
         startAlarm(timeout);
 
-        // RR confirma a PRÓXIMA Ns (Nr = s_ns ^ 1)
+        // RR confirms the next Ns (Nr = s_ns ^ 1)
         unsigned char rrExpected = (s_ns == 0) ? RR1 : RR0;
-        // REJ pede retransmissões da Ns atual (Nr = s_ns)
+        // REJ asks retransmission for current Ns (Nr = s_ns)
         unsigned char rejExpected = (s_ns == 0) ? REJ0 : REJ1;
 
-        // ler bytes e fazer *state machine* de S/U (FLAG A C BCC1 FLAG)
+        // read bytes and run S/U state machine (FLAG A C BCC1 FLAG)
         State state = START;
-        unsigned char byte = 0;
-        unsigned char lastA = 0; //* WHY?
-        unsigned char lastC = 0; //* WHY?
+        unsigned char rxByte = 0;
+        unsigned char lastAddress = 0; /* last A read */
+        unsigned char lastControl = 0; /* last C read */
 
         while (alarmEnabled)
         {
-            int r = readByteSerialPort(&byte);
-            if (r <= 0)
+            // Destuffing
+            unsigned char rxByteDeStuffed;
+            int unStuffRes = unStuffByteFromSerial(&rxByteDeStuffed, &unStuffState);
+            if (unStuffRes <= 0)
                 continue;
+            rxByte = rxByteDeStuffed;
 
             switch (state)
             {
             case START:
-                if (byte == FLAG)
+                if (rxByte == FLAG)
                     state = FLAG_RCV;
                 break;
 
             case FLAG_RCV:
-                if (byte == ADDRESS_RECEIVER) {
-                    lastA = byte;
+                if (rxByte == ADDRESS_RECEIVER)
+                {
+                    lastAddress = rxByte;
                     state = A_RCV;
                 }
-                else if (byte != FLAG)
+                else if (rxByte != FLAG)
                     state = START;
                 break;
 
             case A_RCV:
-                lastC = byte; // pode ser RR*/REJ*/DISC/UA (embora aqui esperemos RR/REJ)
-                // Aceita RR ou REJ esperados; outros controlos são ignorados em baixo
-                if (byte == rrExpected || byte == rejExpected || byte == DISC || byte == UA)
+                lastControl = rxByte; // may be RR*/REJ*/DISC
+                if (rxByte == rrExpected || rxByte == rejExpected || rxByte == DISC)
                     state = C_RCV;
-                else if (byte == FLAG)
+                else if (rxByte == FLAG)
                     state = FLAG_RCV;
                 else
                     state = START;
                 break;
 
             case C_RCV:
-                // validar BCC1 = A ^ C
-                if (byte == BCC1(lastA, lastC))
+                // validate BCC1 = A ^ C
+                if (rxByte == BCC1(lastAddress, lastControl))
                     state = BCC_OK;
+                else if (rxByte == FLAG)
+                    state = FLAG_RCV;
                 else
                     state = START;
                 break;
 
             case BCC_OK:
-                if (byte == FLAG)
+                if (rxByte == FLAG)
                     state = STOP;
+                else if (rxByte == FLAG)
+                    state = FLAG_RCV;
                 else
                     state = START;
                 break;
@@ -369,33 +417,38 @@ int llwrite(const unsigned char *buf, int bufSize)
 
         stopAlarm();
 
-        if (state == STOP) {
-            if (lastC == rrExpected) {
-                // sucesso -> alterna Ns e devolve bytes enviados
+        if (state == STOP)
+        {
+            if (lastControl == rrExpected)
+            {
+                // success -> toggle Ns and return bytes sent
                 s_ns ^= 1;
                 return bufSize;
             }
-            if (lastC == rejExpected) {
-                // recetor detetou erro -> retransmitir (consome tentativa)
-                tries++;
+            if (lastControl == rejExpected)
+            {
+                // receiver detected error -> retransmit (consume attempt)
+                attemptCount++;
                 continue;
             }
-            if (lastC == DISC) {
-                // recetor a fechar inesperadamente
+            if (lastControl == DISC)
+            {
+                // receiver closing unexpectedly
                 return -1;
             }
-            // outro controlo (p.ex., UA ou RR "errado"): trata como falta de resposta útil
-            tries++;
+            // other control (e.g., UA or unexpected RR): treat as non-useful response
+            attemptCount++;
             continue;
         }
-        else {
+        else
+        {
             // timeout
-            tries++;
+            attemptCount++;
             continue;
         }
     }
 
-    // excedeu retransmissões
+    // exceeded retransmissions
     return -1;
 }
 

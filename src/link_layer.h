@@ -14,6 +14,7 @@
 #define MAX_PAYLOAD_SIZE 1000
 
 #define FLAG 0x7E
+#define ESC 0x7D
 #define ADDRESS_SENDER 0x03
 #define ADDRESS_RECEIVER 0x01
 #define SET 0x03
@@ -24,6 +25,7 @@
 #define REJ1 0x55
 #define DISC 0x0B
 #define BCC1(a, c) ((a) ^ (c))
+#define TRY(expr) do { if ((expr) < 0) return -1;} while(0)
 
 typedef enum
 {
@@ -49,6 +51,11 @@ typedef enum
     BCC_OK,
     STOP
 } State;
+
+typedef struct
+{
+    int escPending;
+} UnStuffState;
 
 // Size of maximum acceptable payload.
 // Maximum number of bytes that application layer should send to link layer.

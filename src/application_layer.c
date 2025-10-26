@@ -150,6 +150,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
     }
     else
     {
+        // TODO: Compor a parte do receiver, mas é melhor depois de implementar a parte do transmissor no link_layer.c
         FILE *file = fopen(filename, "wb");
         if (!file)
         {
@@ -158,22 +159,10 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
             return;
         }
 
-        unsigned char buf[BUF_SIZE];
+        unsigned char buf[MAX_PAYLOAD_SIZE];
+        unsigned char * packet;
 
-        int got;
-        while ((got = llread(buf)) > 0)
-        {
-            if (fwrite(buf, 1, got, file) != got)
-            {
-                perror("fwrite");
-                break;
-            }
-        }
-
-        if (got < 0)
-        {
-            printf("llread: error receiving block\n");
-        }
+        while (1) {}
 
         fclose(file);
     }
