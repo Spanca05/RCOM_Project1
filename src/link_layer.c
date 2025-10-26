@@ -25,7 +25,7 @@ static int stuffFunc(unsigned char inputByte, unsigned char *outBuffer, size_t *
     {
         if ((*outLen) + 2 > outCap)
             return -1;
-        outBuffer[(*outLen)++] = 0x7D;
+        outBuffer[(*outLen)++] = ESC;
         outBuffer[(*outLen)++] = (unsigned char)(inputByte ^ 0x20); // O XOR retorna um signed char?
     }
     else
@@ -107,7 +107,6 @@ void resetUnStuffState(UnStuffState *state)
 ////////////////////////////////////////////////
 int llopen(LinkLayer connectionParameters)
 {
-    // TODO: Falta implementar stuff e unStuff (é mesmo preciso?)
     nTries = connectionParameters.nRetransmissions;
     timeout = connectionParameters.timeout;
     storedRole = connectionParameters.role;
@@ -120,38 +119,46 @@ int llopen(LinkLayer connectionParameters)
 
     if (storedRole == LlTx)
     {
-        setupAlarm();
+        const unsigned char addressField = ADDRESS_SENDER;
+        const unsigned char controlField = SET;
+        const unsigned char bcc1 = BCC1(addressField, controlField);
 
-        unsigned char setFrame[5] = {0};
+        unsigned char setFrame[8];
+        size_t setLen = 0;
 
-        setFrame[0] = FLAG;
-        setFrame[1] = ADDRESS_SENDER;
-        setFrame[2] = SET;
-        setFrame[3] = BCC1(setFrame[1], setFrame[2]);
-        setFrame[4] = FLAG;
+        setFrame[setLen++] = FLAG;
+        TRY(stuffFunc(addressField, setFrame, &setLen, sizeof(setFrame)));
+        TRY(stuffFunc(controlField, setFrame, &setLen, sizeof(setFrame)));
+        TRY(stuffFunc(bcc1, setFrame, &setLen, sizeof(setFrame)));
+        setFrame[setLen++] = FLAG;
 
         int tries = 0;
         int gotUA = 0;
 
+        UnStuffState unStuffState;
+        setupAlarm();
+
         while (!gotUA && tries < nTries)
         {
-            if (writeBytesSerialPort(setFrame, 5) != 5)
+            if (writeBytesSerialPort(setFrame, setLen) != setLen)
             {
                 printf("write SET failed\n");
+                tries++;
+                continue;
             }
 
+            resetUnStuffState(&unStuffState);
             startAlarm(timeout);
 
             State state = START;
+            unsigned char lastA = 0, lastC = 0;
 
             while (state != STOP && alarmEnabled)
             {
                 unsigned char byte;
-                int res = readByteSerialPort(&byte);
+                int res = unStuffByteFromSerial(&byte, &unStuffState);
 
-                if (res < 0)
-                    continue;
-                if (res == 0)
+                if (res <= 0)
                     continue;
 
                 printf("Byte received: 0x%02x\n", byte);
@@ -165,12 +172,16 @@ int llopen(LinkLayer connectionParameters)
 
                 case FLAG_RCV:
                     if (byte == ADDRESS_RECEIVER)
+                    {
+                        lastA = byte;
                         state = A_RCV;
+                    }
                     else if (byte != FLAG)
                         state = START;
                     break;
 
                 case A_RCV:
+                    lastC = byte;
                     if (byte == UA)
                         state = C_RCV;
                     else if (byte == FLAG)
@@ -180,7 +191,7 @@ int llopen(LinkLayer connectionParameters)
                     break;
 
                 case C_RCV:
-                    if (byte == BCC1(ADDRESS_RECEIVER, UA))
+                    if (byte == BCC1(lastA, lastC))
                         state = BCC_OK;
                     else
                         state = START;
@@ -198,10 +209,11 @@ int llopen(LinkLayer connectionParameters)
                 }
             }
 
-            if (state == STOP)
+            if (state == STOP && lastA == ADDRESS_RECEIVER && lastC == UA)
             {
                 gotUA = 1;
                 stopAlarm();
+                break;
             }
             else
                 tries++;
@@ -218,16 +230,18 @@ int llopen(LinkLayer connectionParameters)
     }
     else
     {
+        UnStuffState unStuffState;
+        resetUnStuffState(&unStuffState);
+
         State state = START;
+        unsigned char lastA = 0, lastC = 0;
 
         while (state != STOP)
         {
             unsigned char byte;
-            int r = readByteSerialPort(&byte);
+            int res = unStuffByteFromSerial(&byte, &unStuffState);
 
-            if (r < 0)
-                continue;
-            if (r == 0)
+            if (res <= 0)
                 continue;
 
             printf("Byte received: 0x%02X\n", byte);
@@ -241,20 +255,26 @@ int llopen(LinkLayer connectionParameters)
 
             case FLAG_RCV:
                 if (byte == ADDRESS_SENDER)
+                {
+                    lastA = byte;
                     state = A_RCV;
+                }
                 else if (byte != FLAG)
                     state = START;
                 break;
 
             case A_RCV:
+                lastC = byte;
                 if (byte == SET)
                     state = C_RCV;
                 else if (byte == FLAG)
                     state = FLAG_RCV;
+                else
+                    state = START;
                 break;
 
             case C_RCV:
-                if (byte == BCC1(ADDRESS_SENDER, SET))
+                if (byte == BCC1(lastA, lastC))
                     state = BCC_OK;
                 else
                     state = START;
@@ -272,15 +292,20 @@ int llopen(LinkLayer connectionParameters)
             }
         }
 
-        unsigned char ua[5];
+        const unsigned char addressField = ADDRESS_RECEIVER;
+        const unsigned char controlField = UA;
+        const unsigned char bcc1 = BCC1(addressField, controlField);
 
-        ua[0] = FLAG;
-        ua[1] = ADDRESS_RECEIVER;
-        ua[2] = UA;
-        ua[3] = BCC1(ADDRESS_RECEIVER, UA);
-        ua[4] = FLAG;
+        unsigned char uaFrame[8];
+        size_t uaLen = 0;
 
-        if (writeBytesSerialPort(ua, 5) != 5)
+        uaFrame[uaLen++] = FLAG;
+        TRY(stuffFunc(addressField, uaFrame, &uaLen, sizeof(uaFrame)));
+        TRY(stuffFunc(controlField, uaFrame, &uaLen, sizeof(uaFrame)));
+        TRY(stuffFunc(bcc1, uaFrame, &uaLen, sizeof(uaFrame)));
+        uaFrame[uaLen++] = FLAG;
+
+        if (writeBytesSerialPort(uaFrame, uaLen) != uaLen)
         {
             printf("Erro ao enviar UA\n");
             closeSerialPort();
@@ -468,20 +493,19 @@ int llread(unsigned char *packet)
 ////////////////////////////////////////////////
 int llclose()
 {
-    // TODO: Implement this function
     if (storedRole == LlTx)
     {
         const unsigned char addressField = ADDRESS_SENDER;
         const unsigned char controlField = DISC;
         const unsigned char bcc1 = BCC1(addressField, controlField);
 
-    unsigned char discFrame[8];
-    size_t discLen = 0;
-    discFrame[discLen++] = FLAG;
-    TRY(stuffFunc(addressField, discFrame, &discLen, sizeof(discFrame)));
-    TRY(stuffFunc(controlField, discFrame, &discLen, sizeof(discFrame)));
-    TRY(stuffFunc(bcc1, discFrame, &discLen, sizeof(discFrame)));
-    discFrame[discLen++] = FLAG;
+        unsigned char discFrame[8];
+        size_t discLen = 0;
+        discFrame[discLen++] = FLAG;
+        TRY(stuffFunc(addressField, discFrame, &discLen, sizeof(discFrame)));
+        TRY(stuffFunc(controlField, discFrame, &discLen, sizeof(discFrame)));
+        TRY(stuffFunc(bcc1, discFrame, &discLen, sizeof(discFrame)));
+        discFrame[discLen++] = FLAG;
 
         int tries = 0;
         int gotDISC = 0;
@@ -520,7 +544,8 @@ int llclose()
                     break;
 
                 case FLAG_RCV:
-                    if (byte == ADDRESS_RECEIVER) {
+                    if (byte == ADDRESS_RECEIVER)
+                    {
                         lastA = byte;
                         state = A_RCV;
                     }
@@ -588,11 +613,13 @@ int llclose()
         uaFrame[uaLen++] = FLAG;
 
         writeBytesSerialPort(uaFrame, uaLen);
-        
+
         closeSerialPort();
         return 0;
     }
     // TODO: Implementar para o receiver
-    else {}
+    else
+    {
+    }
     return 0;
 }
