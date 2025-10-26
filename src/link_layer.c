@@ -620,6 +620,97 @@ int llclose()
     // TODO: Implementar para o receiver
     else
     {
+        UnStuffState unStuffState;
+        resetUnStuffState(&unStuffState);
+
+        State state = START;
+        unsigned char lastA = 0, lastC = 0;
+
+        while (state != STOP)
+        {
+            unsigned char byte;
+            int res = unStuffByteFromSerial(&byte, &unStuffState);
+
+            if (res <= 0)
+                continue;
+
+            printf("Byte received: 0x%02X\n", byte);
+
+            switch (state)
+            {
+            case START:
+                if (byte == FLAG)
+                    state = FLAG_RCV;
+                break;
+
+            case FLAG_RCV:
+                if (byte == ADDRESS_SENDER)
+                {
+                    lastA = byte;
+                    state = A_RCV;
+                }
+                else if (byte != FLAG)
+                    state = START;
+                break;
+
+            case A_RCV:
+                lastC = byte;
+                if (byte == DISC)
+                    state = C_RCV;
+                else if (byte == FLAG)
+                    state = FLAG_RCV;
+                else
+                    state = START;
+                break;
+
+            case C_RCV:
+                if (byte == BCC1(lastA, lastC))
+                    state = BCC_OK;
+                else
+                    state = START;
+                break;
+
+            case BCC_OK:
+                if (byte == FLAG)
+                    state = STOP;
+                else
+                    state = START;
+                break;
+
+            default:
+                break;
+            }
+        }
+
+        /* If we didn't receive a proper DISC from transmitter, bail out */
+        if (!(lastA == ADDRESS_SENDER && lastC == DISC))
+        {
+            closeSerialPort();
+            return -1;
+        }
+
+        /* Send DISC back (stuffed), using ADDRESS_RECEIVER */
+        const unsigned char addressField = ADDRESS_RECEIVER;
+        const unsigned char controlField = DISC;
+        const unsigned char bcc1 = BCC1(addressField, controlField);
+
+        unsigned char discFrame[8];
+        size_t discLen = 0;
+
+        discFrame[discLen++] = FLAG;
+        TRY(stuffFunc(addressField, discFrame, &discLen, sizeof(discFrame)));
+        TRY(stuffFunc(controlField, discFrame, &discLen, sizeof(discFrame)));
+        TRY(stuffFunc(bcc1, discFrame, &discLen, sizeof(discFrame)));
+        discFrame[discLen++] = FLAG;
+
+        if (writeBytesSerialPort(discFrame, discLen) != discLen)
+        {
+            printf("Erro ao enviar UA\n");
+            closeSerialPort();
+            return -1;
+        }
+        
+        return 0;
     }
     return 0;
 }
