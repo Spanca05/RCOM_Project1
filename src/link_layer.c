@@ -43,7 +43,7 @@ static int stuffFunc(unsigned char inputByte, unsigned char *outBuffer, size_t *
 // in: buffer de entrada (possivelmente com escapes), inLen: tamanho da entrada
 // out: buffer destino, outCap: capacidade de out
 // Retorna número de bytes escritos em out, ou -1 em caso de erro (escape truncado ou overflow)
-static int unStuffFunc(const unsigned char *inBuffer, size_t inLen, unsigned char *outBuffer, size_t outCap)
+/* static int unStuffFunc(const unsigned char *inBuffer, size_t inLen, unsigned char *outBuffer, size_t outCap)
 {
     // TODO: Fazer eu a função e percebê-la
     int outIndex = 0;
@@ -69,7 +69,7 @@ static int unStuffFunc(const unsigned char *inBuffer, size_t inLen, unsigned cha
     }
 
     return outIndex;
-}
+} */
 
 static int unStuffByteFromSerial(unsigned char *out, UnStuffState *state)
 {

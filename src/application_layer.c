@@ -1,7 +1,7 @@
 // Application layer protocol implementation
 
-#include <stdio.h>  
-#include <stdlib.h> 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "application_layer.h"
 #include "link_layer.h"
@@ -150,21 +150,158 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
     }
     else
     {
-        // TODO: Compor a parte do receiver, mas é melhor depois de implementar a parte do transmissor no link_layer.c
-        FILE *file = fopen(filename, "wb");
-        if (!file)
+        /* Receiver: wait for START control packet, then DATA packets, then END*/
+        unsigned char packetBuf[MAX_PAYLOAD_SIZE + 32];
+        int received;
+
+        FILE *outFile = NULL;
+        long expectedFileSize = 0;
+        long totalWritten = 0;
+        char remoteFilename[256] = {0};
+
+        while (1)
         {
-            perror("fopen (rx)");
-            llclose();
-            return;
+            received = llread(packetBuf);
+            if (received < 0)
+            {
+                fprintf(stderr, "llread error\n");
+                if (outFile)
+                    fclose(outFile);
+                llclose();
+                return;
+            }
+
+            if (received == 0)
+                continue;
+
+            unsigned char type = packetBuf[0];
+
+            if (type == 1)
+            {
+                /* START control packet: parse TLV parameters */
+                size_t idx = 1;
+                while (idx + 1 < (size_t)received)
+                {
+                    unsigned char paramType = packetBuf[idx++];
+                    unsigned char paramLen = packetBuf[idx++];
+                    if (idx + paramLen > (size_t)received)
+                        break; /* malformed */
+
+                    if (paramType == 0)
+                    {
+                        /* file size (long) */
+                        long fsz = 0;
+                        if (paramLen == sizeof(long))
+                        {
+                            memcpy(&fsz, &packetBuf[idx], sizeof(long));
+                            expectedFileSize = fsz;
+                        }
+                    }
+                    else if (paramType == 1)
+                    {
+                        /* filename */
+                        size_t nameLen = paramLen;
+                        if (nameLen >= sizeof(remoteFilename))
+                            nameLen = sizeof(remoteFilename) - 1;
+                        memcpy(remoteFilename, &packetBuf[idx], nameLen);
+                        remoteFilename[nameLen] = '\0';
+                    }
+
+                    idx += paramLen;
+                }
+
+                /* open output file (use remote filename if provided, else use provided filename)
+                   If sender provided a filename like "penguin.gif", create a local name
+                   by appending "-received" before the extension: "penguin-received.gif" */
+                char outNameBuf[512] = {0};
+                if (remoteFilename[0] != '\0')
+                {
+                    /* insert "-received" before last dot if present */
+                    char *dot = strrchr(remoteFilename, '.');
+                    if (dot != NULL && dot != remoteFilename)
+                    {
+                        size_t baseLen = (size_t)(dot - remoteFilename);
+                        if (baseLen + strlen("-received") + strlen(dot) + 1 <= sizeof(outNameBuf))
+                            snprintf(outNameBuf, sizeof(outNameBuf), "%.*s-received%s", (int)baseLen, remoteFilename, dot);
+                        else
+                            /* fallback to safe copy */
+                            strncpy(outNameBuf, remoteFilename, sizeof(outNameBuf) - 1);
+                    }
+                    else
+                    {
+                        /* no extension: just append suffix */
+                        if (strlen(remoteFilename) + strlen("-received") + 1 <= sizeof(outNameBuf))
+                            snprintf(outNameBuf, sizeof(outNameBuf), "%s-received", remoteFilename);
+                        else
+                            strncpy(outNameBuf, remoteFilename, sizeof(outNameBuf) - 1);
+                    }
+                }
+                else
+                {
+                    strncpy(outNameBuf, filename, sizeof(outNameBuf) - 1);
+                }
+
+                outFile = fopen(outNameBuf, "wb");
+                if (!outFile)
+                {
+                    perror("fopen (rx)");
+                    llclose();
+                    return;
+                }
+                totalWritten = 0;
+                fprintf(stderr, "Receiving file '%s' size=%ld bytes\n", outNameBuf, expectedFileSize);
+            }
+            else if (type == 2)
+            {
+                /* DATA packet: 1 byte type + 2 bytes length + payload */
+                if (received < 3)
+                    continue; /* malformed */
+
+                unsigned char l2 = packetBuf[1];
+                unsigned char l1 = packetBuf[2];
+                int dataLen = ((int)l2 << 8) | (int)l1;
+                if (dataLen < 0 || dataLen > MAX_PAYLOAD_SIZE)
+                    continue; /* invalid */
+
+                if (received < 3 + dataLen)
+                    continue; /* truncated */
+
+                if (!outFile)
+                {
+                    /* Haven't received START; open with provided filename */
+                    outFile = fopen(filename, "wb");
+                    if (!outFile)
+                    {
+                        perror("fopen (rx fallback)");
+                        llclose();
+                        return;
+                    }
+                }
+
+                size_t written = fwrite(&packetBuf[3], 1, dataLen, outFile);
+                fflush(outFile);
+                totalWritten += (long)written;
+                (void)written;
+            }
+            else if (type == 3)
+            {
+                /* END control packet: optionally parse and finish */
+                /* Could parse TLV to verify size/filename */
+                if (outFile)
+                {
+                    fclose(outFile);
+                    outFile = NULL;
+                }
+                fprintf(stderr, "File transfer complete, %ld bytes written\n", totalWritten);
+                break;
+            }
+            else
+            {
+                /* unknown packet type: ignore */
+            }
         }
-
-        //unsigned char buf[MAX_PAYLOAD_SIZE];
-        //unsigned char * packet;
-
-        while (1) {}
-
-        fclose(file);
+        if(outFile)
+            fclose(outFile);
     }
 
     if (llclose() == 0)
