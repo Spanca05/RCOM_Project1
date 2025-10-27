@@ -48,7 +48,9 @@ typedef enum
     FLAG_RCV,
     A_RCV,
     C_RCV,
-    BCC_OK,
+    BCC1_OK,
+    D_RCV,
+    BCC2_OK,
     STOP
 } State;
 

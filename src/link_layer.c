@@ -7,6 +7,7 @@
 int nTries = 3;
 int timeout = 3;
 static unsigned char s_ns = 0;
+static unsigned char expected_ns = 0;
 static LinkLayerRole storedRole = LlTx;
 
 static unsigned char bcc2Calc(const unsigned char *data, int len)
@@ -192,12 +193,12 @@ int llopen(LinkLayer connectionParameters)
 
                 case C_RCV:
                     if (byte == BCC1(lastA, lastC))
-                        state = BCC_OK;
+                        state = BCC1_OK;
                     else
                         state = START;
                     break;
 
-                case BCC_OK:
+                case BCC1_OK:
                     if (byte == FLAG)
                         state = STOP;
                     else
@@ -275,12 +276,12 @@ int llopen(LinkLayer connectionParameters)
 
             case C_RCV:
                 if (byte == BCC1(lastA, lastC))
-                    state = BCC_OK;
+                    state = BCC1_OK;
                 else
                     state = START;
                 break;
 
-            case BCC_OK:
+            case BCC1_OK:
                 if (byte == FLAG)
                     state = STOP;
                 else
@@ -419,14 +420,14 @@ int llwrite(const unsigned char *buf, int bufSize)
             case C_RCV:
                 // validate BCC1 = A ^ C
                 if (rxByte == BCC1(lastAddress, lastControl))
-                    state = BCC_OK;
+                    state = BCC1_OK;
                 else if (rxByte == FLAG)
                     state = FLAG_RCV;
                 else
                     state = START;
                 break;
 
-            case BCC_OK:
+            case BCC1_OK:
                 if (rxByte == FLAG)
                     state = STOP;
                 else
@@ -483,9 +484,156 @@ int llwrite(const unsigned char *buf, int bufSize)
 ////////////////////////////////////////////////
 int llread(unsigned char *packet)
 {
-    // TODO: Implement this function
+    // TODO: Ver se está correto
+    UnStuffState unStuffState;
+    resetUnStuffState(&unStuffState);
 
-    return 0;
+    State state = START;
+    unsigned char rxByte;
+    unsigned char lastA = 0, lastC = 0;
+    unsigned char dataBuf[MAX_PAYLOAD_SIZE + 1]; // payload + bcc2
+    size_t dataIndex = 0;
+
+    while (1)
+    {
+        int r = unStuffByteFromSerial(&rxByte, &unStuffState);
+        if (r <= 0)
+            continue;
+
+        switch (state)
+        {
+        case START:
+            if (rxByte == FLAG)
+                state = FLAG_RCV;
+            break;
+
+        case FLAG_RCV:
+            if (rxByte == ADDRESS_SENDER)
+            {
+                lastA = rxByte;
+                state = A_RCV;
+            }
+            else if (rxByte != FLAG)
+                state = START;
+            break;
+
+        case A_RCV:
+            lastC = rxByte; // control
+            state = C_RCV;
+            break;
+
+        case C_RCV:
+            if (rxByte == BCC1(lastA, lastC))
+            {
+                /* I-frame? control 0x00 or 0x80 */
+                if (lastC == 0x00 || lastC == 0x80)
+                {
+                    dataIndex = 0;
+                    state = D_RCV;
+                }
+                else
+                {
+                    /* supervisory - ignore for llread */
+                    state = START;
+                }
+            }
+            else if (rxByte == FLAG)
+                state = FLAG_RCV;
+            else
+                state = START;
+            break;
+
+        case D_RCV:
+            if (rxByte == FLAG)
+            {
+                /* end of I-frame: last byte is BCC2 */
+                if (dataIndex < 1)
+                {
+                    state = FLAG_RCV;
+                    break;
+                }
+
+                unsigned char recv_bcc2 = dataBuf[dataIndex - 1];
+                size_t payloadLen = dataIndex - 1;
+                unsigned char calc_bcc2 = bcc2Calc(dataBuf, (int)payloadLen);
+                unsigned char ns = (lastC >> 7) & 0x01;
+
+                if (calc_bcc2 == recv_bcc2 && ns == expected_ns)
+                {
+                    /* good frame */
+                    if (payloadLen > MAX_PAYLOAD_SIZE)
+                        return -1;
+
+                    memcpy(packet, dataBuf, payloadLen);
+                    expected_ns ^= 1; /* accept -> expect next */
+
+                    /* send RR acknowledging next expected (Nr = expected_ns) */
+                    unsigned char rrToSend = (expected_ns == 0) ? RR0 : RR1;
+                    unsigned char rrFrame[8];
+                    size_t rrLen = 0;
+                    rrFrame[rrLen++] = FLAG;
+                    TRY(stuffFunc(ADDRESS_RECEIVER, rrFrame, &rrLen, sizeof(rrFrame)));
+                    TRY(stuffFunc(rrToSend, rrFrame, &rrLen, sizeof(rrFrame)));
+                    TRY(stuffFunc(BCC1(ADDRESS_RECEIVER, rrToSend), rrFrame, &rrLen, sizeof(rrFrame)));
+                    rrFrame[rrLen++] = FLAG;
+                    if (writeBytesSerialPort(rrFrame, rrLen) != rrLen)
+                        return -1;
+
+                    return (int)payloadLen;
+                }
+                else if (calc_bcc2 != recv_bcc2)
+                {
+                    /* BCC2 error: request retransmission (REJ for current expected_ns) */
+                    unsigned char rejToSend = (expected_ns == 0) ? REJ0 : REJ1;
+                    unsigned char rejFrame[8];
+                    size_t rejLen = 0;
+                    rejFrame[rejLen++] = FLAG;
+                    TRY(stuffFunc(ADDRESS_RECEIVER, rejFrame, &rejLen, sizeof(rejFrame)));
+                    TRY(stuffFunc(rejToSend, rejFrame, &rejLen, sizeof(rejFrame)));
+                    TRY(stuffFunc(BCC1(ADDRESS_RECEIVER, rejToSend), rejFrame, &rejLen, sizeof(rejFrame)));
+                    rejFrame[rejLen++] = FLAG;
+                    if (writeBytesSerialPort(rejFrame, rejLen) != rejLen)
+                        return -1;
+
+                    state = START; /* wait for retransmission */
+                }
+                else
+                {
+                    /* duplicate frame (ns != expected_ns): re-ack with RR(expected_ns) */
+                    unsigned char rrToSend = (expected_ns == 0) ? RR0 : RR1;
+                    unsigned char rrFrame[8];
+                    size_t rrLen = 0;
+                    rrFrame[rrLen++] = FLAG;
+                    TRY(stuffFunc(ADDRESS_RECEIVER, rrFrame, &rrLen, sizeof(rrFrame)));
+                    TRY(stuffFunc(rrToSend, rrFrame, &rrLen, sizeof(rrFrame)));
+                    TRY(stuffFunc(BCC1(ADDRESS_RECEIVER, rrToSend), rrFrame, &rrLen, sizeof(rrFrame)));
+                    rrFrame[rrLen++] = FLAG;
+                    if (writeBytesSerialPort(rrFrame, rrLen) != rrLen)
+                        return -1;
+
+                    state = START;
+                }
+            }
+            else
+            {
+                /* regular data byte */
+                if (dataIndex + 1 > sizeof(dataBuf))
+                {
+                    /* overflow: discard frame */
+                    state = START;
+                    break;
+                }
+                dataBuf[dataIndex++] = rxByte;
+            }
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    /* unreachable */
+    return -1;
 }
 
 ////////////////////////////////////////////////
@@ -565,12 +713,12 @@ int llclose()
 
                 case C_RCV:
                     if (byte == BCC1(lastA, lastC))
-                        state = BCC_OK;
+                        state = BCC1_OK;
                     else
                         state = START;
                     break;
 
-                case BCC_OK:
+                case BCC1_OK:
                     if (byte == FLAG)
                         state = STOP;
                     else
@@ -617,7 +765,6 @@ int llclose()
         closeSerialPort();
         return 0;
     }
-    // TODO: Implementar para o receiver
     else
     {
         UnStuffState unStuffState;
@@ -665,12 +812,12 @@ int llclose()
 
             case C_RCV:
                 if (byte == BCC1(lastA, lastC))
-                    state = BCC_OK;
+                    state = BCC1_OK;
                 else
                     state = START;
                 break;
 
-            case BCC_OK:
+            case BCC1_OK:
                 if (byte == FLAG)
                     state = STOP;
                 else
@@ -709,7 +856,7 @@ int llclose()
             closeSerialPort();
             return -1;
         }
-        
+
         return 0;
     }
     return 0;
