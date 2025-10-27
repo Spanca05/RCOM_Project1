@@ -18,6 +18,11 @@ static unsigned char bcc2Calc(const unsigned char *data, int len)
     return bcc2;
 }
 
+// Track whether the last returned byte from unStuffByteFromSerial
+// was produced from an ESC-escaped sequence (i.e., data), so that
+// receivers can distinguish a data 0x7E from a real frame FLAG 0x7E.
+static int g_lastFromEscape = 0;
+
 // Safer stuffing: escreve no buffer de saída mantendo controle de capacidade.
 // Retorna o novo outLen (>=0) ou -1 em caso de overflow.
 static int stuffFunc(unsigned char inputByte, unsigned char *outBuffer, size_t *outLen, size_t outCap)
@@ -82,23 +87,29 @@ static int unStuffByteFromSerial(unsigned char *out, UnStuffState *state)
     {
         state->escPending = 0;
         *out = (unsigned char)(rx ^ 0x20);
+        // This output byte originated from an escape sequence
+        g_lastFromEscape = 1;
         return 1;
     }
 
     if (rx == ESC)
     {
         state->escPending = 1;
+        // No output yet, retain lastFromEscape unchanged
         return 0;
     }
 
     // If rx == FLAG, it's still FLAG
     *out = rx;
+    // Direct byte from the line (not from escape)
+    g_lastFromEscape = 0;
     return 1;
 }
 
 void resetUnStuffState(UnStuffState *state)
 {
     state->escPending = 0;
+    g_lastFromEscape = 0;
 }
 
 // TODO: Implementar sendSupervisionFrame para código ficar mais modular e se perceber melhor
@@ -328,10 +339,14 @@ int llwrite(const unsigned char *buf, int bufSize)
     if (bufSize <= 0)
         return -1;
 
+    printf("llwrite called with bufSize=%d, s_ns=%d\n", bufSize, s_ns);
+
     const unsigned char controlField = (s_ns == 0) ? 0x00 : 0x80;
     const unsigned char addressField = ADDRESS_SENDER;
     const unsigned char bcc1 = BCC1(addressField, controlField);
     const unsigned char bcc2 = bcc2Calc(buf, bufSize);
+
+    printf("Calculated BCC2=0x%02X for %d bytes\n", bcc2, bufSize);
 
     // Worst case: FLAG + 2 * (A, C, BCC1, payload, BCC2) + FLAG
     const unsigned maxFrameSize = 1 + 2 * (4 + bufSize) + 1;
@@ -484,14 +499,13 @@ int llwrite(const unsigned char *buf, int bufSize)
 ////////////////////////////////////////////////
 int llread(unsigned char *packet)
 {
-    // TODO: Ver se está correto
     UnStuffState unStuffState;
     resetUnStuffState(&unStuffState);
 
     State state = START;
     unsigned char rxByte;
     unsigned char lastA = 0, lastC = 0;
-    unsigned char dataBuf[MAX_PAYLOAD_SIZE + 1]; // payload + bcc2
+    unsigned char dataBuf[MAX_PAYLOAD_SIZE + 10]; // Extra space for BCC2 and margin
     size_t dataIndex = 0;
 
     while (1)
@@ -507,6 +521,19 @@ int llread(unsigned char *packet)
                 state = FLAG_RCV;
             break;
 
+        case BCC2_OK:
+            if (rxByte == FLAG)
+                state = STOP;
+            else
+                state = START;
+            break;
+
+        case STOP:
+            // We shouldn't reach this state in the switch
+            // as we handle STOP conditions before entering the switch
+            state = START;
+            break;
+
         case FLAG_RCV:
             if (rxByte == ADDRESS_SENDER)
             {
@@ -518,15 +545,24 @@ int llread(unsigned char *packet)
             break;
 
         case A_RCV:
-            lastC = rxByte; // control
-            state = C_RCV;
+            lastC = rxByte;
+            if (rxByte == FLAG)
+                state = FLAG_RCV;
+            else if (rxByte == 0x00 || rxByte == 0x80 || rxByte == DISC) // Information frame or DISC
+                state = C_RCV;
+            else
+                state = START;
             break;
 
         case C_RCV:
             if (rxByte == BCC1(lastA, lastC))
             {
-                /* I-frame? control 0x00 or 0x80 */
-                if (lastC == 0x00 || lastC == 0x80)
+                if (lastC == DISC)
+                {
+                    // Handle disconnection separately
+                    state = BCC1_OK;
+                }
+                else if (lastC == 0x00 || lastC == 0x80) // Information frame
                 {
                     dataIndex = 0;
                     state = D_RCV;
@@ -543,99 +579,132 @@ int llread(unsigned char *packet)
                 state = START;
             break;
 
-        case D_RCV:
+        case BCC1_OK:
             if (rxByte == FLAG)
             {
-                /* end of I-frame: last byte is BCC2 */
-                if (dataIndex < 1)
+                if (lastC == DISC)
                 {
-                    state = FLAG_RCV;
+                    // Valid DISC frame received
+                    // Send DISC response
+                    unsigned char responseFrame[5] = {FLAG};
+                    size_t responseLen = 1;
+                    stuffFunc(ADDRESS_RECEIVER, responseFrame, &responseLen, sizeof(responseFrame));
+                    stuffFunc(DISC, responseFrame, &responseLen, sizeof(responseFrame));
+                    stuffFunc(BCC1(ADDRESS_RECEIVER, DISC), responseFrame, &responseLen, sizeof(responseFrame));
+                    responseFrame[responseLen++] = FLAG;
+                    writeBytesSerialPort(responseFrame, responseLen);
+                    return -1; // Signal disconnection to upper layer
+                }
+            }
+            state = START;
+            break;
+
+        case D_RCV:
+            // Only consider FLAG as end-of-frame if it's a real flag from the line,
+            // not a data byte produced by an ESC sequence (stuffed 0x7E)
+            if (rxByte == FLAG && g_lastFromEscape == 0)
+            {
+                if (dataIndex < 1) // Need at least BCC2
+                {
+                    printf("Frame too short, dataIndex=%zu\n", dataIndex);
+                    state = START;
                     break;
                 }
 
-                unsigned char recv_bcc2 = dataBuf[dataIndex - 1];
-                size_t payloadLen = dataIndex - 1;
-                unsigned char calc_bcc2 = bcc2Calc(dataBuf, (int)payloadLen);
-                unsigned char ns = (lastC >> 7) & 0x01;
+                // Last byte is BCC2
+                unsigned char receivedBcc2 = dataBuf[dataIndex - 1];
+                unsigned char calculatedBcc2 = bcc2Calc(dataBuf, dataIndex - 1);
 
-                if (calc_bcc2 == recv_bcc2 && ns == expected_ns)
+                // Create response frame
+                unsigned char responseFrame[8]; // Increased size for safety
+                size_t responseLen = 0;
+
+                // Get frame sequence number
+                unsigned char ns = (lastC == 0x00) ? 0 : 1;
+
+                printf("Received I-frame: ns=%d, expected_ns=%d, dataIndex=%zu, BCC2: recv=0x%02X calc=0x%02X\n",
+                       ns, expected_ns, dataIndex, receivedBcc2, calculatedBcc2);
+
+                // Debug: print first few bytes of data
+                printf("First 10 data bytes: ");
+                for (size_t i = 0; i < (dataIndex < 10 ? dataIndex : 10); i++)
                 {
-                    /* good frame */
-                    if (payloadLen > MAX_PAYLOAD_SIZE)
-                        return -1;
-
-                    memcpy(packet, dataBuf, payloadLen);
-                    expected_ns ^= 1; /* accept -> expect next */
-
-                    /* send RR acknowledging next expected (Nr = expected_ns) */
-                    unsigned char rrToSend = (expected_ns == 0) ? RR0 : RR1;
-                    unsigned char rrFrame[8];
-                    size_t rrLen = 0;
-                    rrFrame[rrLen++] = FLAG;
-                    TRY(stuffFunc(ADDRESS_RECEIVER, rrFrame, &rrLen, sizeof(rrFrame)));
-                    TRY(stuffFunc(rrToSend, rrFrame, &rrLen, sizeof(rrFrame)));
-                    TRY(stuffFunc(BCC1(ADDRESS_RECEIVER, rrToSend), rrFrame, &rrLen, sizeof(rrFrame)));
-                    rrFrame[rrLen++] = FLAG;
-                    if (writeBytesSerialPort(rrFrame, rrLen) != rrLen)
-                        return -1;
-
-                    return (int)payloadLen;
+                    printf("%02X ", dataBuf[i]);
                 }
-                else if (calc_bcc2 != recv_bcc2)
-                {
-                    /* BCC2 error: request retransmission (REJ for current expected_ns) */
-                    unsigned char rejToSend = (expected_ns == 0) ? REJ0 : REJ1;
-                    unsigned char rejFrame[8];
-                    size_t rejLen = 0;
-                    rejFrame[rejLen++] = FLAG;
-                    TRY(stuffFunc(ADDRESS_RECEIVER, rejFrame, &rejLen, sizeof(rejFrame)));
-                    TRY(stuffFunc(rejToSend, rejFrame, &rejLen, sizeof(rejFrame)));
-                    TRY(stuffFunc(BCC1(ADDRESS_RECEIVER, rejToSend), rejFrame, &rejLen, sizeof(rejFrame)));
-                    rejFrame[rejLen++] = FLAG;
-                    if (writeBytesSerialPort(rejFrame, rejLen) != rejLen)
-                        return -1;
+                printf("\n");
 
-                    state = START; /* wait for retransmission */
+                if (receivedBcc2 == calculatedBcc2 && ns == expected_ns)
+                {
+                    // Valid frame and correct sequence number
+                    memcpy(packet, dataBuf, dataIndex - 1);
+
+                    // Send RR for next frame
+                    expected_ns ^= 1; // Toggle expected sequence number
+                    unsigned char rr = (expected_ns == 0) ? RR0 : RR1;
+
+                    // Build RR frame
+                    responseFrame[responseLen++] = FLAG;
+                    stuffFunc(ADDRESS_RECEIVER, responseFrame, &responseLen, sizeof(responseFrame));
+                    stuffFunc(rr, responseFrame, &responseLen, sizeof(responseFrame));
+                    stuffFunc(BCC1(ADDRESS_RECEIVER, rr), responseFrame, &responseLen, sizeof(responseFrame));
+                    responseFrame[responseLen++] = FLAG;
+
+                    // Send RR
+                    printf("Sending RR(%d), frame length=%zu\n", expected_ns, responseLen);
+                    printf("RR frame bytes: ");
+                    for (size_t i = 0; i < responseLen; i++)
+                    {
+                        printf("%02X ", responseFrame[i]);
+                    }
+                    printf("\n");
+                    int written = writeBytesSerialPort(responseFrame, responseLen);
+                    printf("Bytes written: %d\n", written);
+
+                    return dataIndex - 1; // Return payload size (excluding BCC2)
                 }
                 else
                 {
-                    /* duplicate frame (ns != expected_ns): re-ack with RR(expected_ns) */
-                    unsigned char rrToSend = (expected_ns == 0) ? RR0 : RR1;
-                    unsigned char rrFrame[8];
-                    size_t rrLen = 0;
-                    rrFrame[rrLen++] = FLAG;
-                    TRY(stuffFunc(ADDRESS_RECEIVER, rrFrame, &rrLen, sizeof(rrFrame)));
-                    TRY(stuffFunc(rrToSend, rrFrame, &rrLen, sizeof(rrFrame)));
-                    TRY(stuffFunc(BCC1(ADDRESS_RECEIVER, rrToSend), rrFrame, &rrLen, sizeof(rrFrame)));
-                    rrFrame[rrLen++] = FLAG;
-                    if (writeBytesSerialPort(rrFrame, rrLen) != rrLen)
-                        return -1;
+                    // Either BCC2 error or wrong sequence number - reject frame
+                    unsigned char rej = (expected_ns == 0) ? REJ0 : REJ1;
 
-                    state = START;
+                    // Build REJ frame
+                    responseFrame[responseLen++] = FLAG;
+                    stuffFunc(ADDRESS_RECEIVER, responseFrame, &responseLen, sizeof(responseFrame));
+                    stuffFunc(rej, responseFrame, &responseLen, sizeof(responseFrame));
+                    stuffFunc(BCC1(ADDRESS_RECEIVER, rej), responseFrame, &responseLen, sizeof(responseFrame));
+                    responseFrame[responseLen++] = FLAG;
+
+                    // Send REJ
+                    printf("Sending REJ(%d), frame length=%zu (BCC2 error or duplicate)\n", expected_ns, responseLen);
+                    printf("REJ frame bytes: ");
+                    for (size_t i = 0; i < responseLen; i++)
+                    {
+                        printf("%02X ", responseFrame[i]);
+                    }
+                    printf("\n");
+                    int written = writeBytesSerialPort(responseFrame, responseLen);
+                    printf("Bytes written: %d\n", written);
                 }
+
+                state = START;
+                break;
             }
             else
             {
-                /* regular data byte */
-                if (dataIndex + 1 > sizeof(dataBuf))
+                // Regular data byte
+                if (dataIndex < sizeof(dataBuf))
+                    dataBuf[dataIndex++] = rxByte;
+                else
                 {
-                    /* overflow: discard frame */
+                    // Buffer overflow - discard frame
+                    printf("WARNING: Buffer overflow in D_RCV, dataIndex=%zu\n", dataIndex);
                     state = START;
-                    break;
                 }
-                dataBuf[dataIndex++] = rxByte;
             }
-            break;
-
-        default:
             break;
         }
     }
-
-    /* unreachable */
-    return -1;
 }
-
 ////////////////////////////////////////////////
 // LLCLOSE
 ////////////////////////////////////////////////
