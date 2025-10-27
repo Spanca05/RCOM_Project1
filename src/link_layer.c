@@ -43,7 +43,7 @@ static int stuffFunc(unsigned char inputByte, unsigned char *outBuffer, size_t *
 // in: buffer de entrada (possivelmente com escapes), inLen: tamanho da entrada
 // out: buffer destino, outCap: capacidade de out
 // Retorna número de bytes escritos em out, ou -1 em caso de erro (escape truncado ou overflow)
-static int unStuffFunc(const unsigned char *inBuffer, size_t inLen, unsigned char *outBuffer, size_t outCap)
+/*static int unStuffFunc(const unsigned char *inBuffer, size_t inLen, unsigned char *outBuffer, size_t outCap)
 {
     // TODO: Fazer eu a função e percebê-la
     int outIndex = 0;
@@ -69,7 +69,7 @@ static int unStuffFunc(const unsigned char *inBuffer, size_t inLen, unsigned cha
     }
 
     return outIndex;
-}
+}*/
 
 static int unStuffByteFromSerial(unsigned char *out, UnStuffState *state)
 {
@@ -852,11 +852,82 @@ int llclose()
 
         if (writeBytesSerialPort(discFrame, discLen) != discLen)
         {
-            printf("Erro ao enviar UA\n");
+            printf("Erro ao enviar Disc\n");
             closeSerialPort();
             return -1;
         }
 
+        state = START;
+        int gotUA = 0;
+
+        UnStuffState unStuffState_UA;
+
+        while (state != STOP)
+        {
+            unsigned char byte;
+            int res = unStuffByteFromSerial(&byte, &unStuffState_UA);
+
+            if (res <= 0)
+                continue;
+
+            printf("Byte received: 0x%02x\n", byte);
+
+            switch (state)
+            {
+            case START:
+                if (byte == FLAG)
+                    state = FLAG_RCV;
+                break;
+
+            case FLAG_RCV:
+                if (byte == ADDRESS_SENDER)
+                {
+                    lastA = byte;
+                    state = A_RCV;
+                }
+                else if (byte != FLAG)
+                    state = START;
+                break;
+
+            case A_RCV:
+                lastC = byte;
+                if (byte == UA)
+                    state = C_RCV;
+                else if (byte == FLAG)
+                    state = FLAG_RCV;
+                else
+                    state = START;
+                break;
+
+            case C_RCV:
+                if (byte == BCC1(lastA, lastC))
+                    state = BCC1_OK;
+                else
+                    state = START;
+                break;
+
+            case BCC1_OK:
+                if (byte == FLAG)
+                    state = STOP;
+                else
+                    state = START;
+                break;
+
+            default:
+                break;
+            }
+        }
+
+        if (state == STOP && lastA == ADDRESS_SENDER && lastC == UA)
+            gotUA = 1;
+
+        if (!gotUA)
+        {
+            printf("UA not received");
+            closeSerialPort();
+            return -1;
+        }
+        
         return 0;
     }
     return 0;
