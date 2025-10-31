@@ -25,7 +25,12 @@
 #define REJ1 0x55
 #define DISC 0x0B
 #define BCC1(a, c) ((a) ^ (c))
-#define TRY(expr) do { if ((expr) < 0) return -1;} while(0)
+#define TRY(expr)       \
+    do                  \
+    {                   \
+        if ((expr) < 0) \
+            return -1;  \
+    } while (0)
 
 typedef enum
 {
@@ -56,7 +61,8 @@ typedef enum
 
 typedef struct
 {
-    int escPending;
+    int escPending;     // waiting for a byte after ESC
+    int lastFromEscape; // whether the last output byte was produced from an ESC sequence
 } UnStuffState;
 
 // Size of maximum acceptable payload.
