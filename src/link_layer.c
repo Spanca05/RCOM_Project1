@@ -453,8 +453,10 @@ int llwrite(const unsigned char *buf, int bufSize)
             }
             if (lastControl == rejExpected)
             {
-                // receiver detected error -> retransmit (consume attempt)
-                attemptCount++;
+                // Receiver detected error -> retransmit WITHOUT consuming attempt
+                // REJ means communication is working, just data was corrupted
+                // Only timeouts should consume retry attempts
+                printf("[llwrite] REJ received, retransmitting without consuming retry\n");
                 continue;
             }
             if (lastControl == DISC)
@@ -468,7 +470,8 @@ int llwrite(const unsigned char *buf, int bufSize)
         }
         else
         {
-            // timeout
+            // timeout - no response received, consume a retry attempt
+            printf("[llwrite] Timeout on attempt %d, incrementing retry counter\n", attemptCount + 1);
             attemptCount++;
             continue;
         }
