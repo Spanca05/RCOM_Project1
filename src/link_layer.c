@@ -18,10 +18,9 @@ static unsigned char bcc2Calc(const unsigned char *data, int len)
     return bcc2;
 }
 
-// Track whether the last returned byte from unStuffByteFromSerial
-// was produced from an ESC-escaped sequence (i.e., data), so that
-// receivers can distinguish a data 0x7E from a real frame FLAG 0x7E.
-static int g_lastFromEscape = 0;
+// Note: whether the last returned byte was produced from an ESC-escaped
+// sequence is now stored per-UnStuffState (see link_layer.h). This avoids
+// interference when nested state machines call unStuffByteFromSerial.
 
 // Safer stuffing: escreve no buffer de saída mantendo controle de capacidade.
 // Retorna o novo outLen (>=0) ou -1 em caso de overflow.
@@ -56,7 +55,7 @@ static int unStuffByteFromSerial(unsigned char *out, UnStuffState *state)
         state->escPending = 0;
         *out = (unsigned char)(rx ^ 0x20);
         // This output byte originated from an escape sequence
-        g_lastFromEscape = 1;
+        state->lastFromEscape = 1;
         return 1;
     }
 
@@ -70,14 +69,14 @@ static int unStuffByteFromSerial(unsigned char *out, UnStuffState *state)
     // If rx == FLAG, it's still FLAG
     *out = rx;
     // Direct byte from the line (not from escape)
-    g_lastFromEscape = 0;
+    state->lastFromEscape = 0;
     return 1;
 }
 
 void resetUnStuffState(UnStuffState *state)
 {
     state->escPending = 0;
-    g_lastFromEscape = 0;
+    state->lastFromEscape = 0;
 }
 
 // TODO: Implementar sendSupervisionFrame para código ficar mais modular e se perceber melhor
@@ -645,7 +644,7 @@ int llread(unsigned char *packet)
         case D_RCV:
             // Only consider FLAG as end-of-frame if it's a real flag from the line,
             // not a data byte produced by an ESC sequence (stuffed 0x7E)
-            if (rxByte == FLAG && g_lastFromEscape == 0)
+            if (rxByte == FLAG && unStuffState.lastFromEscape == 0)
             {
                 if (dataIndex < 1) // Need at least BCC2
                 {
