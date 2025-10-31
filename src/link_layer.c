@@ -18,6 +18,11 @@ static unsigned char bcc2Calc(const unsigned char *data, int len)
     return bcc2;
 }
 
+// Track whether the last returned byte from unStuffByteFromSerial
+// was produced from an ESC-escaped sequence (i.e., data), so that
+// receivers can distinguish a data 0x7E from a real frame FLAG 0x7E.
+static int g_lastFromEscape = 0;
+
 // Safer stuffing: escreve no buffer de saída mantendo controle de capacidade.
 // Retorna o novo outLen (>=0) ou -1 em caso de overflow.
 static int stuffFunc(unsigned char inputByte, unsigned char *outBuffer, size_t *outLen, size_t outCap)
@@ -39,38 +44,6 @@ static int stuffFunc(unsigned char inputByte, unsigned char *outBuffer, size_t *
     return 0;
 }
 
-// Un-stuffing: converte sequências escapadas (0x7D 0x5E -> 0x7E, 0x7D 0x5D -> 0x7D)
-// in: buffer de entrada (possivelmente com escapes), inLen: tamanho da entrada
-// out: buffer destino, outCap: capacidade de out
-// Retorna número de bytes escritos em out, ou -1 em caso de erro (escape truncado ou overflow)
-/*static int unStuffFunc(const unsigned char *inBuffer, size_t inLen, unsigned char *outBuffer, size_t outCap)
-{
-    // TODO: Fazer eu a função e percebê-la
-    int outIndex = 0;
-
-    for (int inIndex = 0; inIndex < inLen; inIndex++)
-    {
-        unsigned char currByte = inBuffer[inIndex];
-
-        if (currByte == ESC)
-        {
-            // precisa existir um próximo byte
-            if (inIndex + 1 >= inLen)
-                return -1; // escape truncado
-
-            unsigned char nextByte = inBuffer[++inIndex];
-            //! Inverso do stuffing (XOR seguido de XOR cancela-se?)
-            currByte = (unsigned char)(nextByte ^ 0x20);
-        }
-
-        if (outIndex + 1 > outCap)
-            return -1; // overflow
-        outBuffer[outIndex++] = currByte;
-    }
-
-    return outIndex;
-}*/
-
 static int unStuffByteFromSerial(unsigned char *out, UnStuffState *state)
 {
     unsigned char rx;
@@ -82,23 +55,29 @@ static int unStuffByteFromSerial(unsigned char *out, UnStuffState *state)
     {
         state->escPending = 0;
         *out = (unsigned char)(rx ^ 0x20);
+        // This output byte originated from an escape sequence
+        g_lastFromEscape = 1;
         return 1;
     }
 
     if (rx == ESC)
     {
         state->escPending = 1;
+        // No output yet, retain lastFromEscape unchanged
         return 0;
     }
 
     // If rx == FLAG, it's still FLAG
     *out = rx;
+    // Direct byte from the line (not from escape)
+    g_lastFromEscape = 0;
     return 1;
 }
 
 void resetUnStuffState(UnStuffState *state)
 {
     state->escPending = 0;
+    g_lastFromEscape = 0;
 }
 
 // TODO: Implementar sendSupervisionFrame para código ficar mais modular e se perceber melhor
@@ -110,6 +89,31 @@ int llopen(LinkLayer connectionParameters)
 {
     nTries = connectionParameters.nRetransmissions;
     timeout = connectionParameters.timeout;
+
+    // Allow runtime override via environment for stress tests
+    const char *envRetries = getenv("LL_RETRIES");
+    if (envRetries && *envRetries)
+    {
+        char *endp = NULL;
+        long v = strtol(envRetries, &endp, 10);
+        if (endp != envRetries && v > 0 && v <= 1000)
+        {
+            nTries = (int)v;
+            fprintf(stderr, "[LL] Using LL_RETRIES=%d (overriding default %d)\n", nTries, connectionParameters.nRetransmissions);
+        }
+    }
+    const char *envTimeout = getenv("LL_TIMEOUT");
+    if (envTimeout && *envTimeout)
+    {
+        char *endp = NULL;
+        long v = strtol(envTimeout, &endp, 10);
+        if (endp != envTimeout && v > 0 && v <= 60)
+        {
+            timeout = (int)v;
+            fprintf(stderr, "[LL] Using LL_TIMEOUT=%d seconds (overriding default %d)\n", timeout, connectionParameters.timeout);
+        }
+    }
+
     storedRole = connectionParameters.role;
 
     if (openSerialPort(connectionParameters.serialPort, connectionParameters.baudRate) == -1)
@@ -124,14 +128,9 @@ int llopen(LinkLayer connectionParameters)
         const unsigned char controlField = SET;
         const unsigned char bcc1 = BCC1(addressField, controlField);
 
-        unsigned char setFrame[8];
-        size_t setLen = 0;
-
-        setFrame[setLen++] = FLAG;
-        TRY(stuffFunc(addressField, setFrame, &setLen, sizeof(setFrame)));
-        TRY(stuffFunc(controlField, setFrame, &setLen, sizeof(setFrame)));
-        TRY(stuffFunc(bcc1, setFrame, &setLen, sizeof(setFrame)));
-        setFrame[setLen++] = FLAG;
+        // Supervision frames are NOT stuffed
+        unsigned char setFrame[5] = {FLAG, addressField, controlField, bcc1, FLAG};
+        size_t setLen = 5;
 
         int tries = 0;
         int gotUA = 0;
@@ -297,14 +296,9 @@ int llopen(LinkLayer connectionParameters)
         const unsigned char controlField = UA;
         const unsigned char bcc1 = BCC1(addressField, controlField);
 
-        unsigned char uaFrame[8];
-        size_t uaLen = 0;
-
-        uaFrame[uaLen++] = FLAG;
-        TRY(stuffFunc(addressField, uaFrame, &uaLen, sizeof(uaFrame)));
-        TRY(stuffFunc(controlField, uaFrame, &uaLen, sizeof(uaFrame)));
-        TRY(stuffFunc(bcc1, uaFrame, &uaLen, sizeof(uaFrame)));
-        uaFrame[uaLen++] = FLAG;
+        // Supervision frames are NOT stuffed
+        unsigned char uaFrame[5] = {FLAG, addressField, controlField, bcc1, FLAG};
+        size_t uaLen = 5;
 
         if (writeBytesSerialPort(uaFrame, uaLen) != uaLen)
         {
@@ -328,10 +322,14 @@ int llwrite(const unsigned char *buf, int bufSize)
     if (bufSize <= 0)
         return -1;
 
+    printf("llwrite called with bufSize=%d, s_ns=%d\n", bufSize, s_ns);
+
     const unsigned char controlField = (s_ns == 0) ? 0x00 : 0x80;
     const unsigned char addressField = ADDRESS_SENDER;
     const unsigned char bcc1 = BCC1(addressField, controlField);
     const unsigned char bcc2 = bcc2Calc(buf, bufSize);
+
+    printf("Calculated BCC2=0x%02X for %d bytes\n", bcc2, bufSize);
 
     // Worst case: FLAG + 2 * (A, C, BCC1, payload, BCC2) + FLAG
     const unsigned maxFrameSize = 1 + 2 * (4 + bufSize) + 1;
@@ -361,6 +359,7 @@ int llwrite(const unsigned char *buf, int bufSize)
     /* follow the same retry semantics as llopen (attemptCount < nTries) */
     while (attemptCount < nTries)
     {
+        printf("[llwrite] Attempt %d (attemptCount=%d, nTries=%d)\n", attemptCount + 1, attemptCount, nTries);
         resetUnStuffState(&unStuffState);
         if (writeBytesSerialPort(frame, frameLen) != frameLen)
         {
@@ -454,8 +453,10 @@ int llwrite(const unsigned char *buf, int bufSize)
             }
             if (lastControl == rejExpected)
             {
-                // receiver detected error -> retransmit (consume attempt)
-                attemptCount++;
+                // Receiver detected error -> retransmit WITHOUT consuming attempt
+                // REJ means communication is working, just data was corrupted
+                // Only timeouts should consume retry attempts
+                printf("[llwrite] REJ received, retransmitting without consuming retry\n");
                 continue;
             }
             if (lastControl == DISC)
@@ -469,7 +470,8 @@ int llwrite(const unsigned char *buf, int bufSize)
         }
         else
         {
-            // timeout
+            // timeout - no response received, consume a retry attempt
+            printf("[llwrite] Timeout on attempt %d, incrementing retry counter\n", attemptCount + 1);
             attemptCount++;
             continue;
         }
@@ -484,14 +486,13 @@ int llwrite(const unsigned char *buf, int bufSize)
 ////////////////////////////////////////////////
 int llread(unsigned char *packet)
 {
-    // TODO: Ver se está correto
     UnStuffState unStuffState;
     resetUnStuffState(&unStuffState);
 
     State state = START;
     unsigned char rxByte;
     unsigned char lastA = 0, lastC = 0;
-    unsigned char dataBuf[MAX_PAYLOAD_SIZE + 1]; // payload + bcc2
+    unsigned char dataBuf[MAX_PAYLOAD_SIZE + 10]; // Extra space for BCC2 and margin
     size_t dataIndex = 0;
 
     while (1)
@@ -507,6 +508,19 @@ int llread(unsigned char *packet)
                 state = FLAG_RCV;
             break;
 
+        case BCC2_OK:
+            if (rxByte == FLAG)
+                state = STOP;
+            else
+                state = START;
+            break;
+
+        case STOP:
+            // We shouldn't reach this state in the switch
+            // as we handle STOP conditions before entering the switch
+            state = START;
+            break;
+
         case FLAG_RCV:
             if (rxByte == ADDRESS_SENDER)
             {
@@ -518,15 +532,24 @@ int llread(unsigned char *packet)
             break;
 
         case A_RCV:
-            lastC = rxByte; // control
-            state = C_RCV;
+            lastC = rxByte;
+            if (rxByte == FLAG)
+                state = FLAG_RCV;
+            else if (rxByte == 0x00 || rxByte == 0x80 || rxByte == DISC) // Information frame or DISC
+                state = C_RCV;
+            else
+                state = START;
             break;
 
         case C_RCV:
             if (rxByte == BCC1(lastA, lastC))
             {
-                /* I-frame? control 0x00 or 0x80 */
-                if (lastC == 0x00 || lastC == 0x80)
+                if (lastC == DISC)
+                {
+                    // Handle disconnection separately
+                    state = BCC1_OK;
+                }
+                else if (lastC == 0x00 || lastC == 0x80) // Information frame
                 {
                     dataIndex = 0;
                     state = D_RCV;
@@ -540,102 +563,186 @@ int llread(unsigned char *packet)
             else if (rxByte == FLAG)
                 state = FLAG_RCV;
             else
+            {
+                printf("BCC1 error: expected 0x%02X, got 0x%02X (A=0x%02X, C=0x%02X)\n",
+                       BCC1(lastA, lastC), rxByte, lastA, lastC);
                 state = START;
+            }
+            break;
+
+        case BCC1_OK:
+            if (rxByte == FLAG)
+            {
+                if (lastC == DISC)
+                {
+                    // Valid DISC frame received - handle the entire disconnect handshake
+                    // Send DISC response
+                    unsigned char discFrame[5] = {FLAG, ADDRESS_RECEIVER, DISC, BCC1(ADDRESS_RECEIVER, DISC), FLAG};
+                    writeBytesSerialPort(discFrame, 5);
+
+                    // Wait for UA from transmitter
+                    UnStuffState uaState;
+                    resetUnStuffState(&uaState);
+                    State uaWaitState = START;
+                    unsigned char uaA = 0, uaC = 0;
+
+                    while (uaWaitState != STOP)
+                    {
+                        unsigned char uaByte;
+                        int uaRes = unStuffByteFromSerial(&uaByte, &uaState);
+                        if (uaRes <= 0)
+                            continue;
+
+                        switch (uaWaitState)
+                        {
+                        case START:
+                            if (uaByte == FLAG)
+                                uaWaitState = FLAG_RCV;
+                            break;
+                        case FLAG_RCV:
+                            if (uaByte == ADDRESS_SENDER)
+                            {
+                                uaA = uaByte;
+                                uaWaitState = A_RCV;
+                            }
+                            else if (uaByte != FLAG)
+                                uaWaitState = START;
+                            break;
+                        case A_RCV:
+                            uaC = uaByte;
+                            if (uaByte == UA)
+                                uaWaitState = C_RCV;
+                            else if (uaByte == FLAG)
+                                uaWaitState = FLAG_RCV;
+                            else
+                                uaWaitState = START;
+                            break;
+                        case C_RCV:
+                            if (uaByte == BCC1(uaA, uaC))
+                                uaWaitState = BCC1_OK;
+                            else if (uaByte == FLAG)
+                                uaWaitState = FLAG_RCV;
+                            else
+                                uaWaitState = START;
+                            break;
+                        case BCC1_OK:
+                            if (uaByte == FLAG)
+                                uaWaitState = STOP;
+                            else
+                                uaWaitState = START;
+                            break;
+                        default:
+                            break;
+                        }
+                    }
+
+                    return 0; // Return 0 to signal end of transmission (not error)
+                }
+            }
+            state = START;
             break;
 
         case D_RCV:
-            if (rxByte == FLAG)
+            // Only consider FLAG as end-of-frame if it's a real flag from the line,
+            // not a data byte produced by an ESC sequence (stuffed 0x7E)
+            if (rxByte == FLAG && g_lastFromEscape == 0)
             {
-                /* end of I-frame: last byte is BCC2 */
-                if (dataIndex < 1)
+                if (dataIndex < 1) // Need at least BCC2
                 {
-                    state = FLAG_RCV;
+                    printf("Frame too short, dataIndex=%zu\n", dataIndex);
+                    state = START;
                     break;
                 }
 
-                unsigned char recv_bcc2 = dataBuf[dataIndex - 1];
-                size_t payloadLen = dataIndex - 1;
-                unsigned char calc_bcc2 = bcc2Calc(dataBuf, (int)payloadLen);
-                unsigned char ns = (lastC >> 7) & 0x01;
+                // Last byte is BCC2
+                unsigned char receivedBcc2 = dataBuf[dataIndex - 1];
+                unsigned char calculatedBcc2 = bcc2Calc(dataBuf, dataIndex - 1);
 
-                if (calc_bcc2 == recv_bcc2 && ns == expected_ns)
+                // Get frame sequence number
+                unsigned char ns = (lastC == 0x00) ? 0 : 1;
+
+                printf("Received I-frame: ns=%d, expected_ns=%d, dataIndex=%zu, BCC2: recv=0x%02X calc=0x%02X\n",
+                       ns, expected_ns, dataIndex, receivedBcc2, calculatedBcc2);
+
+                // Debug: print first few bytes of data
+                printf("First 10 data bytes: ");
+                for (size_t i = 0; i < (dataIndex < 10 ? dataIndex : 10); i++)
                 {
-                    /* good frame */
-                    if (payloadLen > MAX_PAYLOAD_SIZE)
-                        return -1;
-
-                    memcpy(packet, dataBuf, payloadLen);
-                    expected_ns ^= 1; /* accept -> expect next */
-
-                    /* send RR acknowledging next expected (Nr = expected_ns) */
-                    unsigned char rrToSend = (expected_ns == 0) ? RR0 : RR1;
-                    unsigned char rrFrame[8];
-                    size_t rrLen = 0;
-                    rrFrame[rrLen++] = FLAG;
-                    TRY(stuffFunc(ADDRESS_RECEIVER, rrFrame, &rrLen, sizeof(rrFrame)));
-                    TRY(stuffFunc(rrToSend, rrFrame, &rrLen, sizeof(rrFrame)));
-                    TRY(stuffFunc(BCC1(ADDRESS_RECEIVER, rrToSend), rrFrame, &rrLen, sizeof(rrFrame)));
-                    rrFrame[rrLen++] = FLAG;
-                    if (writeBytesSerialPort(rrFrame, rrLen) != rrLen)
-                        return -1;
-
-                    return (int)payloadLen;
+                    printf("%02X ", dataBuf[i]);
                 }
-                else if (calc_bcc2 != recv_bcc2)
-                {
-                    /* BCC2 error: request retransmission (REJ for current expected_ns) */
-                    unsigned char rejToSend = (expected_ns == 0) ? REJ0 : REJ1;
-                    unsigned char rejFrame[8];
-                    size_t rejLen = 0;
-                    rejFrame[rejLen++] = FLAG;
-                    TRY(stuffFunc(ADDRESS_RECEIVER, rejFrame, &rejLen, sizeof(rejFrame)));
-                    TRY(stuffFunc(rejToSend, rejFrame, &rejLen, sizeof(rejFrame)));
-                    TRY(stuffFunc(BCC1(ADDRESS_RECEIVER, rejToSend), rejFrame, &rejLen, sizeof(rejFrame)));
-                    rejFrame[rejLen++] = FLAG;
-                    if (writeBytesSerialPort(rejFrame, rejLen) != rejLen)
-                        return -1;
+                printf("\n");
 
-                    state = START; /* wait for retransmission */
+                if (receivedBcc2 == calculatedBcc2)
+                {
+                    if (ns == expected_ns)
+                    {
+                        // Valid frame and correct sequence number
+                        memcpy(packet, dataBuf, dataIndex - 1);
+                        // Send RR for next frame
+                        expected_ns ^= 1; // Toggle expected sequence number
+                        unsigned char rr = (expected_ns == 0) ? RR0 : RR1;
+
+                        // Supervision frames are NOT stuffed
+                        unsigned char responseFrame[5] = {FLAG, ADDRESS_RECEIVER, rr, BCC1(ADDRESS_RECEIVER, rr), FLAG};
+
+                        printf("Sending RR(%d), frame length=5\n", expected_ns);
+                        writeBytesSerialPort(responseFrame, 5);
+
+                        return (int)(dataIndex - 1);
+                    }
+                    else
+                    {
+                        unsigned char rr_dup = (expected_ns == 0) ? RR0 : RR1;
+
+                        // Supervision frames are NOT stuffed
+                        unsigned char responseFrame[5] = {FLAG, ADDRESS_RECEIVER, rr_dup, BCC1(ADDRESS_RECEIVER, rr_dup), FLAG};
+
+                        printf("Dup frame: sending RR(%d)\n", expected_ns);
+                        writeBytesSerialPort(responseFrame, 5);
+
+                        state = START;
+                        break;
+                    }
                 }
                 else
                 {
-                    /* duplicate frame (ns != expected_ns): re-ack with RR(expected_ns) */
-                    unsigned char rrToSend = (expected_ns == 0) ? RR0 : RR1;
-                    unsigned char rrFrame[8];
-                    size_t rrLen = 0;
-                    rrFrame[rrLen++] = FLAG;
-                    TRY(stuffFunc(ADDRESS_RECEIVER, rrFrame, &rrLen, sizeof(rrFrame)));
-                    TRY(stuffFunc(rrToSend, rrFrame, &rrLen, sizeof(rrFrame)));
-                    TRY(stuffFunc(BCC1(ADDRESS_RECEIVER, rrToSend), rrFrame, &rrLen, sizeof(rrFrame)));
-                    rrFrame[rrLen++] = FLAG;
-                    if (writeBytesSerialPort(rrFrame, rrLen) != rrLen)
-                        return -1;
+                    // Either BCC2 error or wrong sequence number - reject frame
+                    unsigned char rej = (expected_ns == 0) ? REJ0 : REJ1;
 
-                    state = START;
+                    // Supervision frames are NOT stuffed
+                    unsigned char responseFrame[5] = {FLAG, ADDRESS_RECEIVER, rej, BCC1(ADDRESS_RECEIVER, rej), FLAG};
+
+                    // Send REJ
+                    printf("Sending REJ(%d), frame length=5 (BCC2 error or duplicate)\n", expected_ns);
+                    printf("REJ frame bytes: ");
+                    for (size_t i = 0; i < 5; i++)
+                    {
+                        printf("%02X ", responseFrame[i]);
+                    }
+                    printf("\n");
+                    int written = writeBytesSerialPort(responseFrame, 5);
+                    printf("Bytes written: %d\n", written);
                 }
+
+                state = START;
+                break;
             }
             else
             {
-                /* regular data byte */
-                if (dataIndex + 1 > sizeof(dataBuf))
+                // Regular data byte
+                if (dataIndex < sizeof(dataBuf))
+                    dataBuf[dataIndex++] = rxByte;
+                else
                 {
-                    /* overflow: discard frame */
+                    // Buffer overflow - discard frame
+                    printf("WARNING: Buffer overflow in D_RCV, dataIndex=%zu\n", dataIndex);
                     state = START;
-                    break;
                 }
-                dataBuf[dataIndex++] = rxByte;
             }
-            break;
-
-        default:
             break;
         }
     }
-
-    /* unreachable */
-    return -1;
 }
-
 ////////////////////////////////////////////////
 // LLCLOSE
 ////////////////////////////////////////////////
@@ -647,13 +754,9 @@ int llclose()
         const unsigned char controlField = DISC;
         const unsigned char bcc1 = BCC1(addressField, controlField);
 
-        unsigned char discFrame[8];
-        size_t discLen = 0;
-        discFrame[discLen++] = FLAG;
-        TRY(stuffFunc(addressField, discFrame, &discLen, sizeof(discFrame)));
-        TRY(stuffFunc(controlField, discFrame, &discLen, sizeof(discFrame)));
-        TRY(stuffFunc(bcc1, discFrame, &discLen, sizeof(discFrame)));
-        discFrame[discLen++] = FLAG;
+        // Supervision frames are NOT stuffed
+        unsigned char discFrame[5] = {FLAG, addressField, controlField, bcc1, FLAG};
+        size_t discLen = 5;
 
         int tries = 0;
         int gotDISC = 0;
@@ -747,20 +850,13 @@ int llclose()
             return -1;
         }
 
-        // Envia UA final (stuffed)
+        // Send UA final - supervision frames are NOT stuffed
         const unsigned char C_UA = UA;
         const unsigned char B1_UA = BCC1(addressField, C_UA);
 
-        unsigned char uaFrame[8];
-        size_t uaLen = 0;
+        unsigned char uaFrame[5] = {FLAG, addressField, C_UA, B1_UA, FLAG};
 
-        uaFrame[uaLen++] = FLAG;
-        TRY(stuffFunc(addressField, uaFrame, &uaLen, sizeof(uaFrame)));
-        TRY(stuffFunc(C_UA, uaFrame, &uaLen, sizeof(uaFrame)));
-        TRY(stuffFunc(B1_UA, uaFrame, &uaLen, sizeof(uaFrame)));
-        uaFrame[uaLen++] = FLAG;
-
-        writeBytesSerialPort(uaFrame, uaLen);
+        writeBytesSerialPort(uaFrame, 5);
 
         closeSerialPort();
         return 0;
@@ -836,99 +932,106 @@ int llclose()
             return -1;
         }
 
-        /* Send DISC back (stuffed), using ADDRESS_RECEIVER */
+        /* Send DISC back - supervision frames are NOT stuffed */
         const unsigned char addressField = ADDRESS_RECEIVER;
         const unsigned char controlField = DISC;
         const unsigned char bcc1 = BCC1(addressField, controlField);
 
-        unsigned char discFrame[8];
-        size_t discLen = 0;
-
-        discFrame[discLen++] = FLAG;
-        TRY(stuffFunc(addressField, discFrame, &discLen, sizeof(discFrame)));
-        TRY(stuffFunc(controlField, discFrame, &discLen, sizeof(discFrame)));
-        TRY(stuffFunc(bcc1, discFrame, &discLen, sizeof(discFrame)));
-        discFrame[discLen++] = FLAG;
+        unsigned char discFrame[5] = {FLAG, addressField, controlField, bcc1, FLAG};
+        size_t discLen = 5;
 
         if (writeBytesSerialPort(discFrame, discLen) != discLen)
         {
-            printf("Erro ao enviar Disc\n");
+            printf("Erro ao enviar DISC\n");
             closeSerialPort();
             return -1;
         }
 
-        state = START;
+        UnStuffState unStuffState2;
+        setupAlarm();
+
+        int tries2 = 0;
         int gotUA = 0;
 
-        UnStuffState unStuffState_UA;
-
-        while (state != STOP)
+        while (!gotUA && tries2 < nTries)
         {
-            unsigned char byte;
-            int res = unStuffByteFromSerial(&byte, &unStuffState_UA);
+            resetUnStuffState(&unStuffState2);
+            startAlarm(timeout);
 
-            if (res <= 0)
-                continue;
+            State st = START;
+            unsigned char a2 = 0, c2 = 0;
 
-            printf("Byte received: 0x%02x\n", byte);
-
-            switch (state)
+            while (st != STOP && alarmEnabled)
             {
-            case START:
-                if (byte == FLAG)
-                    state = FLAG_RCV;
-                break;
+                unsigned char b;
+                int res = unStuffByteFromSerial(&b, &unStuffState2);
+                if (res <= 0)
+                    continue;
 
-            case FLAG_RCV:
-                if (byte == ADDRESS_SENDER)
+                switch (st)
                 {
-                    lastA = byte;
-                    state = A_RCV;
+                case START:
+                    if (b == FLAG)
+                        st = FLAG_RCV;
+                    break;
+                case FLAG_RCV:
+                    if (b == ADDRESS_SENDER)
+                    {
+                        a2 = b;
+                        st = A_RCV;
+                    }
+                    else if (b != FLAG)
+                        st = START;
+                    break;
+                case A_RCV:
+                    c2 = b;
+                    if (b == UA)
+                        st = C_RCV;
+                    else if (b == FLAG)
+                        st = FLAG_RCV;
+                    else
+                        st = START;
+                    break;
+                case C_RCV:
+                    if (b == BCC1(a2, c2))
+                        st = BCC1_OK;
+                    else if (b == FLAG)
+                        st = FLAG_RCV;
+                    else
+                        st = START;
+                    break;
+                case BCC1_OK:
+                    if (b == FLAG)
+                        st = STOP;
+                    else
+                        st = START;
+                    break;
+                default:
+                    break;
                 }
-                else if (byte != FLAG)
-                    state = START;
-                break;
+            }
 
-            case A_RCV:
-                lastC = byte;
-                if (byte == UA)
-                    state = C_RCV;
-                else if (byte == FLAG)
-                    state = FLAG_RCV;
-                else
-                    state = START;
-                break;
-
-            case C_RCV:
-                if (byte == BCC1(lastA, lastC))
-                    state = BCC1_OK;
-                else
-                    state = START;
-                break;
-
-            case BCC1_OK:
-                if (byte == FLAG)
-                    state = STOP;
-                else
-                    state = START;
-                break;
-
-            default:
+            if (st == STOP && a2 == ADDRESS_SENDER && c2 == UA)
+            {
+                gotUA = 1;
+                stopAlarm();
                 break;
             }
-        }
 
-        if (state == STOP && lastA == ADDRESS_SENDER && lastC == UA)
-            gotUA = 1;
+            stopAlarm();
+            tries2++;
+
+            writeBytesSerialPort(discFrame, discLen);
+        }
 
         if (!gotUA)
         {
-            printf("UA not received");
+            printf("llclose (Rx): UA não recebido após %d tentativas\n", tries2);
             closeSerialPort();
             return -1;
         }
-        
+
+        closeSerialPort();
         return 0;
     }
-    return 0;
 }
