@@ -108,12 +108,32 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
 
         long int fileSize = getFileSize(file);
         unsigned char *content = getData(file, fileSize);
+        if (!content)
+        {
+            perror("malloc content");
+            fclose(file);
+            llclose();
+            return;
+        }
 
         // Send START Control Packet
         size_t startControlPacketSize;
         unsigned char *startControlPacket = getControlPacket(1, filename, fileSize, &startControlPacketSize);
-        llwrite(startControlPacket, (int)startControlPacketSize);
+        if (!startControlPacket)
+        {
+            free(content);
+            fclose(file);
+            llclose();
+            return;
+        }
+        int ok = llwrite(startControlPacket, (int)startControlPacketSize);
         free(startControlPacket);
+        if (ok < 0)
+        {
+            llclose();
+            fclose(file);
+            return;
+        }
 
         unsigned char buf[MAX_PAYLOAD_SIZE];
         size_t size;
@@ -123,19 +143,53 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
 
         unsigned char *contentPtr = content;
 
+        // Data packet adds 3 bytes (type + L2 + L1), so limit actual data to keep total <= 1000
+        size_t maxDataPerPacket = MAX_PAYLOAD_SIZE - 3;
+
+        // Allow runtime override via environment variable for testing different frame sizes
+        const char *envPayload = getenv("LL_PAYLOAD");
+        if (envPayload && *envPayload)
+        {
+            char *endp = NULL;
+            long v = strtol(envPayload, &endp, 10);
+            if (endp != envPayload && v > 0 && v <= (long)(MAX_PAYLOAD_SIZE - 3))
+            {
+                maxDataPerPacket = (size_t)v;
+                fprintf(stderr, "[TX] Using LL_PAYLOAD=%zu bytes per DATA packet (total with header: %zu bytes)\n",
+                        maxDataPerPacket, maxDataPerPacket + 3);
+            }
+        }
+
         while (bytesLeft > 0)
         {
-            size = (bytesLeft > MAX_PAYLOAD_SIZE) ? MAX_PAYLOAD_SIZE : (size_t)bytesLeft;
+            size = (bytesLeft > (long)maxDataPerPacket) ? maxDataPerPacket : (size_t)bytesLeft;
 
             memcpy(buf, contentPtr, size);
 
+            dataPacket = getDataPacket(buf, size, &dataPacketSize);
+            if (!dataPacket)
+            {
+                perror("getDataPacket");
+                llclose();
+                fclose(file);
+                free(content);
+                return;
+            }
+
+            int wr = llwrite(dataPacket, (int)dataPacketSize);
+            free(dataPacket);
+
+            if (wr < 0)
+            {
+                fprintf(stderr, "llwrite failed - aborting session.\n");
+                free(content);
+                fclose(file);
+                llclose();
+                return;
+            }
+
             contentPtr += size;
             bytesLeft -= (long)size;
-
-            dataPacket = getDataPacket(buf, size, &dataPacketSize);
-
-            llwrite(dataPacket, (int)dataPacketSize);
-            free(dataPacket);
         }
 
         free(content);
@@ -143,8 +197,14 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         // Send END Control Packet
         size_t endControlPacketSize;
         unsigned char *endControlPacket = getControlPacket(3, filename, fileSize, &endControlPacketSize);
-        llwrite(endControlPacket, (int)endControlPacketSize);
+        ok = llwrite(endControlPacket, (int)endControlPacketSize);
         free(endControlPacket);
+        if (ok < 0)
+        {
+            llclose();
+            fclose(file);
+            return;
+        }
 
         fclose(file);
     }
@@ -154,25 +214,43 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         unsigned char packetBuf[MAX_PAYLOAD_SIZE + 32];
         int received;
 
+        char outPath[512] = {0};
         FILE *outFile = NULL;
         long expectedFileSize = 0;
         long totalWritten = 0;
         char remoteFilename[256] = {0};
+        int haveStart = 0;
 
         while (1)
         {
             received = llread(packetBuf);
             if (received < 0)
             {
+                // Actual error (should not happen in normal operation)
                 fprintf(stderr, "llread error\n");
                 if (outFile)
+                {
                     fclose(outFile);
+                    outFile = NULL;
+                }
+                if (outPath[0])
+                    remove(outPath);
                 llclose();
                 return;
             }
 
             if (received == 0)
-                continue;
+            {
+                // DISC received - end of transmission
+                fprintf(stderr, "Transmitter closed connection\n");
+                if (outFile)
+                {
+                    fclose(outFile);
+                    outFile = NULL;
+                }
+                // Don't call llclose() - DISC handshake already completed in llread
+                return;
+            }
 
             unsigned char type = packetBuf[0];
 
@@ -213,7 +291,6 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
                 /* open output file (use remote filename if provided, else use provided filename)
                    If sender provided a filename like "penguin.gif", create a local name
                    by appending "-received" before the extension: "penguin-received.gif" */
-                char outNameBuf[512] = {0};
                 if (remoteFilename[0] != '\0')
                 {
                     /* insert "-received" before last dot if present */
@@ -221,27 +298,19 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
                     if (dot != NULL && dot != remoteFilename)
                     {
                         size_t baseLen = (size_t)(dot - remoteFilename);
-                        if (baseLen + strlen("-received") + strlen(dot) + 1 <= sizeof(outNameBuf))
-                            snprintf(outNameBuf, sizeof(outNameBuf), "%.*s-received%s", (int)baseLen, remoteFilename, dot);
-                        else
-                            /* fallback to safe copy */
-                            strncpy(outNameBuf, remoteFilename, sizeof(outNameBuf) - 1);
+                        snprintf(outPath, sizeof(outPath), "%.*s-received%s", (int)baseLen, remoteFilename, dot);
                     }
                     else
                     {
-                        /* no extension: just append suffix */
-                        if (strlen(remoteFilename) + strlen("-received") + 1 <= sizeof(outNameBuf))
-                            snprintf(outNameBuf, sizeof(outNameBuf), "%s-received", remoteFilename);
-                        else
-                            strncpy(outNameBuf, remoteFilename, sizeof(outNameBuf) - 1);
+                        snprintf(outPath, sizeof(outPath), "%s-received", remoteFilename);
                     }
                 }
                 else
                 {
-                    strncpy(outNameBuf, filename, sizeof(outNameBuf) - 1);
+                    snprintf(outPath, sizeof(outPath), "%s-received", filename);
                 }
 
-                outFile = fopen(outNameBuf, "wb");
+                outFile = fopen(outPath, "wb");
                 if (!outFile)
                 {
                     perror("fopen (rx)");
@@ -249,7 +318,8 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
                     return;
                 }
                 totalWritten = 0;
-                fprintf(stderr, "Receiving file '%s' size=%ld bytes\n", outNameBuf, expectedFileSize);
+                haveStart = 1;
+                fprintf(stderr, "Receiving file '%s' size=%ld bytes\n", outPath, expectedFileSize);
             }
             else if (type == 2)
             {
@@ -268,30 +338,73 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
 
                 if (!outFile)
                 {
-                    /* Haven't received START; open with provided filename */
+                    if (!haveStart)
+                    {
+                        snprintf(outPath, sizeof(outPath), "%s-received", filename);
+                    }
+
                     outFile = fopen(filename, "wb");
+
+                    /* Haven't received START; open with provided filename */
                     if (!outFile)
                     {
                         perror("fopen (rx fallback)");
                         llclose();
                         return;
                     }
+                    haveStart = 1;
                 }
 
                 size_t written = fwrite(&packetBuf[3], 1, dataLen, outFile);
+                if (written != (size_t)dataLen)
+                {
+                    fprintf(stderr, "fwrite truncated\n");
+                    if (outFile)
+                    {
+                        fclose(outFile);
+                        outFile = NULL;
+                    }
+                    if (outPath[0])
+                        remove(outPath);
+                    llclose();
+                    return;
+                }
                 fflush(outFile);
                 totalWritten += (long)written;
-                (void)written;
             }
             else if (type == 3)
             {
                 /* END control packet: optionally parse and finish */
                 /* Could parse TLV to verify size/filename */
+                if (totalWritten != expectedFileSize)
+                {
+                    fprintf(stderr, "Size mismatch: got %ld, expected %ld\n", totalWritten, expectedFileSize);
+                    if (outFile)
+                    {
+                        fclose(outFile);
+                        outFile = NULL;
+                        remove(outPath);
+                        llclose();
+                        return;
+                    }
+                }
                 if (outFile)
                 {
                     fclose(outFile);
                     outFile = NULL;
                 }
+                fprintf(stderr, "File transfer complete, %ld bytes written\n", totalWritten);
+
+                if (expectedFileSize > 0 && totalWritten != expectedFileSize)
+                {
+                    fprintf(stderr, "Size mismatch: got %ld, expected %ld\n",
+                            totalWritten, expectedFileSize);
+                    if (outPath[0])
+                        remove(outPath); // <-- agora tens o caminho
+                    llclose();
+                    return;
+                }
+
                 fprintf(stderr, "File transfer complete, %ld bytes written\n", totalWritten);
                 break;
             }
@@ -300,7 +413,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
                 /* unknown packet type: ignore */
             }
         }
-        if(outFile)
+        if (outFile)
             fclose(outFile);
     }
 

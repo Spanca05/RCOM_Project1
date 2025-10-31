@@ -44,38 +44,6 @@ static int stuffFunc(unsigned char inputByte, unsigned char *outBuffer, size_t *
     return 0;
 }
 
-// Un-stuffing: converte sequências escapadas (0x7D 0x5E -> 0x7E, 0x7D 0x5D -> 0x7D)
-// in: buffer de entrada (possivelmente com escapes), inLen: tamanho da entrada
-// out: buffer destino, outCap: capacidade de out
-// Retorna número de bytes escritos em out, ou -1 em caso de erro (escape truncado ou overflow)
-/* static int unStuffFunc(const unsigned char *inBuffer, size_t inLen, unsigned char *outBuffer, size_t outCap)
-{
-    // TODO: Fazer eu a função e percebê-la
-    int outIndex = 0;
-
-    for (int inIndex = 0; inIndex < inLen; inIndex++)
-    {
-        unsigned char currByte = inBuffer[inIndex];
-
-        if (currByte == ESC)
-        {
-            // precisa existir um próximo byte
-            if (inIndex + 1 >= inLen)
-                return -1; // escape truncado
-
-            unsigned char nextByte = inBuffer[++inIndex];
-            //! Inverso do stuffing (XOR seguido de XOR cancela-se?)
-            currByte = (unsigned char)(nextByte ^ 0x20);
-        }
-
-        if (outIndex + 1 > outCap)
-            return -1; // overflow
-        outBuffer[outIndex++] = currByte;
-    }
-
-    return outIndex;
-} */
-
 static int unStuffByteFromSerial(unsigned char *out, UnStuffState *state)
 {
     unsigned char rx;
@@ -121,6 +89,31 @@ int llopen(LinkLayer connectionParameters)
 {
     nTries = connectionParameters.nRetransmissions;
     timeout = connectionParameters.timeout;
+
+    // Allow runtime override via environment for stress tests
+    const char *envRetries = getenv("LL_RETRIES");
+    if (envRetries && *envRetries)
+    {
+        char *endp = NULL;
+        long v = strtol(envRetries, &endp, 10);
+        if (endp != envRetries && v > 0 && v <= 1000)
+        {
+            nTries = (int)v;
+            fprintf(stderr, "[LL] Using LL_RETRIES=%d (overriding default %d)\n", nTries, connectionParameters.nRetransmissions);
+        }
+    }
+    const char *envTimeout = getenv("LL_TIMEOUT");
+    if (envTimeout && *envTimeout)
+    {
+        char *endp = NULL;
+        long v = strtol(envTimeout, &endp, 10);
+        if (endp != envTimeout && v > 0 && v <= 60)
+        {
+            timeout = (int)v;
+            fprintf(stderr, "[LL] Using LL_TIMEOUT=%d seconds (overriding default %d)\n", timeout, connectionParameters.timeout);
+        }
+    }
+
     storedRole = connectionParameters.role;
 
     if (openSerialPort(connectionParameters.serialPort, connectionParameters.baudRate) == -1)
@@ -135,14 +128,9 @@ int llopen(LinkLayer connectionParameters)
         const unsigned char controlField = SET;
         const unsigned char bcc1 = BCC1(addressField, controlField);
 
-        unsigned char setFrame[8];
-        size_t setLen = 0;
-
-        setFrame[setLen++] = FLAG;
-        TRY(stuffFunc(addressField, setFrame, &setLen, sizeof(setFrame)));
-        TRY(stuffFunc(controlField, setFrame, &setLen, sizeof(setFrame)));
-        TRY(stuffFunc(bcc1, setFrame, &setLen, sizeof(setFrame)));
-        setFrame[setLen++] = FLAG;
+        // Supervision frames are NOT stuffed
+        unsigned char setFrame[5] = {FLAG, addressField, controlField, bcc1, FLAG};
+        size_t setLen = 5;
 
         int tries = 0;
         int gotUA = 0;
@@ -308,14 +296,9 @@ int llopen(LinkLayer connectionParameters)
         const unsigned char controlField = UA;
         const unsigned char bcc1 = BCC1(addressField, controlField);
 
-        unsigned char uaFrame[8];
-        size_t uaLen = 0;
-
-        uaFrame[uaLen++] = FLAG;
-        TRY(stuffFunc(addressField, uaFrame, &uaLen, sizeof(uaFrame)));
-        TRY(stuffFunc(controlField, uaFrame, &uaLen, sizeof(uaFrame)));
-        TRY(stuffFunc(bcc1, uaFrame, &uaLen, sizeof(uaFrame)));
-        uaFrame[uaLen++] = FLAG;
+        // Supervision frames are NOT stuffed
+        unsigned char uaFrame[5] = {FLAG, addressField, controlField, bcc1, FLAG};
+        size_t uaLen = 5;
 
         if (writeBytesSerialPort(uaFrame, uaLen) != uaLen)
         {
@@ -376,6 +359,7 @@ int llwrite(const unsigned char *buf, int bufSize)
     /* follow the same retry semantics as llopen (attemptCount < nTries) */
     while (attemptCount < nTries)
     {
+        printf("[llwrite] Attempt %d (attemptCount=%d, nTries=%d)\n", attemptCount + 1, attemptCount, nTries);
         resetUnStuffState(&unStuffState);
         if (writeBytesSerialPort(frame, frameLen) != frameLen)
         {
@@ -576,7 +560,11 @@ int llread(unsigned char *packet)
             else if (rxByte == FLAG)
                 state = FLAG_RCV;
             else
+            {
+                printf("BCC1 error: expected 0x%02X, got 0x%02X (A=0x%02X, C=0x%02X)\n",
+                       BCC1(lastA, lastC), rxByte, lastA, lastC);
                 state = START;
+            }
             break;
 
         case BCC1_OK:
@@ -584,16 +572,68 @@ int llread(unsigned char *packet)
             {
                 if (lastC == DISC)
                 {
-                    // Valid DISC frame received
+                    // Valid DISC frame received - handle the entire disconnect handshake
                     // Send DISC response
-                    unsigned char responseFrame[5] = {FLAG};
-                    size_t responseLen = 1;
-                    stuffFunc(ADDRESS_RECEIVER, responseFrame, &responseLen, sizeof(responseFrame));
-                    stuffFunc(DISC, responseFrame, &responseLen, sizeof(responseFrame));
-                    stuffFunc(BCC1(ADDRESS_RECEIVER, DISC), responseFrame, &responseLen, sizeof(responseFrame));
-                    responseFrame[responseLen++] = FLAG;
-                    writeBytesSerialPort(responseFrame, responseLen);
-                    return -1; // Signal disconnection to upper layer
+                    unsigned char discFrame[5] = {FLAG, ADDRESS_RECEIVER, DISC, BCC1(ADDRESS_RECEIVER, DISC), FLAG};
+                    writeBytesSerialPort(discFrame, 5);
+
+                    // Wait for UA from transmitter
+                    UnStuffState uaState;
+                    resetUnStuffState(&uaState);
+                    State uaWaitState = START;
+                    unsigned char uaA = 0, uaC = 0;
+
+                    while (uaWaitState != STOP)
+                    {
+                        unsigned char uaByte;
+                        int uaRes = unStuffByteFromSerial(&uaByte, &uaState);
+                        if (uaRes <= 0)
+                            continue;
+
+                        switch (uaWaitState)
+                        {
+                        case START:
+                            if (uaByte == FLAG)
+                                uaWaitState = FLAG_RCV;
+                            break;
+                        case FLAG_RCV:
+                            if (uaByte == ADDRESS_SENDER)
+                            {
+                                uaA = uaByte;
+                                uaWaitState = A_RCV;
+                            }
+                            else if (uaByte != FLAG)
+                                uaWaitState = START;
+                            break;
+                        case A_RCV:
+                            uaC = uaByte;
+                            if (uaByte == UA)
+                                uaWaitState = C_RCV;
+                            else if (uaByte == FLAG)
+                                uaWaitState = FLAG_RCV;
+                            else
+                                uaWaitState = START;
+                            break;
+                        case C_RCV:
+                            if (uaByte == BCC1(uaA, uaC))
+                                uaWaitState = BCC1_OK;
+                            else if (uaByte == FLAG)
+                                uaWaitState = FLAG_RCV;
+                            else
+                                uaWaitState = START;
+                            break;
+                        case BCC1_OK:
+                            if (uaByte == FLAG)
+                                uaWaitState = STOP;
+                            else
+                                uaWaitState = START;
+                            break;
+                        default:
+                            break;
+                        }
+                    }
+
+                    return 0; // Return 0 to signal end of transmission (not error)
                 }
             }
             state = START;
@@ -615,10 +655,6 @@ int llread(unsigned char *packet)
                 unsigned char receivedBcc2 = dataBuf[dataIndex - 1];
                 unsigned char calculatedBcc2 = bcc2Calc(dataBuf, dataIndex - 1);
 
-                // Create response frame
-                unsigned char responseFrame[8]; // Increased size for safety
-                size_t responseLen = 0;
-
                 // Get frame sequence number
                 unsigned char ns = (lastC == 0x00) ? 0 : 1;
 
@@ -633,56 +669,55 @@ int llread(unsigned char *packet)
                 }
                 printf("\n");
 
-                if (receivedBcc2 == calculatedBcc2 && ns == expected_ns)
+                if (receivedBcc2 == calculatedBcc2)
                 {
-                    // Valid frame and correct sequence number
-                    memcpy(packet, dataBuf, dataIndex - 1);
-
-                    // Send RR for next frame
-                    expected_ns ^= 1; // Toggle expected sequence number
-                    unsigned char rr = (expected_ns == 0) ? RR0 : RR1;
-
-                    // Build RR frame
-                    responseFrame[responseLen++] = FLAG;
-                    stuffFunc(ADDRESS_RECEIVER, responseFrame, &responseLen, sizeof(responseFrame));
-                    stuffFunc(rr, responseFrame, &responseLen, sizeof(responseFrame));
-                    stuffFunc(BCC1(ADDRESS_RECEIVER, rr), responseFrame, &responseLen, sizeof(responseFrame));
-                    responseFrame[responseLen++] = FLAG;
-
-                    // Send RR
-                    printf("Sending RR(%d), frame length=%zu\n", expected_ns, responseLen);
-                    printf("RR frame bytes: ");
-                    for (size_t i = 0; i < responseLen; i++)
+                    if (ns == expected_ns)
                     {
-                        printf("%02X ", responseFrame[i]);
-                    }
-                    printf("\n");
-                    int written = writeBytesSerialPort(responseFrame, responseLen);
-                    printf("Bytes written: %d\n", written);
+                        // Valid frame and correct sequence number
+                        memcpy(packet, dataBuf, dataIndex - 1);
+                        // Send RR for next frame
+                        expected_ns ^= 1; // Toggle expected sequence number
+                        unsigned char rr = (expected_ns == 0) ? RR0 : RR1;
 
-                    return dataIndex - 1; // Return payload size (excluding BCC2)
+                        // Supervision frames are NOT stuffed
+                        unsigned char responseFrame[5] = {FLAG, ADDRESS_RECEIVER, rr, BCC1(ADDRESS_RECEIVER, rr), FLAG};
+
+                        printf("Sending RR(%d), frame length=5\n", expected_ns);
+                        writeBytesSerialPort(responseFrame, 5);
+
+                        return (int)(dataIndex - 1);
+                    }
+                    else
+                    {
+                        unsigned char rr_dup = (expected_ns == 0) ? RR0 : RR1;
+
+                        // Supervision frames are NOT stuffed
+                        unsigned char responseFrame[5] = {FLAG, ADDRESS_RECEIVER, rr_dup, BCC1(ADDRESS_RECEIVER, rr_dup), FLAG};
+
+                        printf("Dup frame: sending RR(%d)\n", expected_ns);
+                        writeBytesSerialPort(responseFrame, 5);
+
+                        state = START;
+                        break;
+                    }
                 }
                 else
                 {
                     // Either BCC2 error or wrong sequence number - reject frame
                     unsigned char rej = (expected_ns == 0) ? REJ0 : REJ1;
 
-                    // Build REJ frame
-                    responseFrame[responseLen++] = FLAG;
-                    stuffFunc(ADDRESS_RECEIVER, responseFrame, &responseLen, sizeof(responseFrame));
-                    stuffFunc(rej, responseFrame, &responseLen, sizeof(responseFrame));
-                    stuffFunc(BCC1(ADDRESS_RECEIVER, rej), responseFrame, &responseLen, sizeof(responseFrame));
-                    responseFrame[responseLen++] = FLAG;
+                    // Supervision frames are NOT stuffed
+                    unsigned char responseFrame[5] = {FLAG, ADDRESS_RECEIVER, rej, BCC1(ADDRESS_RECEIVER, rej), FLAG};
 
                     // Send REJ
-                    printf("Sending REJ(%d), frame length=%zu (BCC2 error or duplicate)\n", expected_ns, responseLen);
+                    printf("Sending REJ(%d), frame length=5 (BCC2 error or duplicate)\n", expected_ns);
                     printf("REJ frame bytes: ");
-                    for (size_t i = 0; i < responseLen; i++)
+                    for (size_t i = 0; i < 5; i++)
                     {
                         printf("%02X ", responseFrame[i]);
                     }
                     printf("\n");
-                    int written = writeBytesSerialPort(responseFrame, responseLen);
+                    int written = writeBytesSerialPort(responseFrame, 5);
                     printf("Bytes written: %d\n", written);
                 }
 
@@ -716,13 +751,9 @@ int llclose()
         const unsigned char controlField = DISC;
         const unsigned char bcc1 = BCC1(addressField, controlField);
 
-        unsigned char discFrame[8];
-        size_t discLen = 0;
-        discFrame[discLen++] = FLAG;
-        TRY(stuffFunc(addressField, discFrame, &discLen, sizeof(discFrame)));
-        TRY(stuffFunc(controlField, discFrame, &discLen, sizeof(discFrame)));
-        TRY(stuffFunc(bcc1, discFrame, &discLen, sizeof(discFrame)));
-        discFrame[discLen++] = FLAG;
+        // Supervision frames are NOT stuffed
+        unsigned char discFrame[5] = {FLAG, addressField, controlField, bcc1, FLAG};
+        size_t discLen = 5;
 
         int tries = 0;
         int gotDISC = 0;
@@ -816,20 +847,13 @@ int llclose()
             return -1;
         }
 
-        // Envia UA final (stuffed)
+        // Send UA final - supervision frames are NOT stuffed
         const unsigned char C_UA = UA;
         const unsigned char B1_UA = BCC1(addressField, C_UA);
 
-        unsigned char uaFrame[8];
-        size_t uaLen = 0;
+        unsigned char uaFrame[5] = {FLAG, addressField, C_UA, B1_UA, FLAG};
 
-        uaFrame[uaLen++] = FLAG;
-        TRY(stuffFunc(addressField, uaFrame, &uaLen, sizeof(uaFrame)));
-        TRY(stuffFunc(C_UA, uaFrame, &uaLen, sizeof(uaFrame)));
-        TRY(stuffFunc(B1_UA, uaFrame, &uaLen, sizeof(uaFrame)));
-        uaFrame[uaLen++] = FLAG;
-
-        writeBytesSerialPort(uaFrame, uaLen);
+        writeBytesSerialPort(uaFrame, 5);
 
         closeSerialPort();
         return 0;
@@ -905,28 +929,106 @@ int llclose()
             return -1;
         }
 
-        /* Send DISC back (stuffed), using ADDRESS_RECEIVER */
+        /* Send DISC back - supervision frames are NOT stuffed */
         const unsigned char addressField = ADDRESS_RECEIVER;
         const unsigned char controlField = DISC;
         const unsigned char bcc1 = BCC1(addressField, controlField);
 
-        unsigned char discFrame[8];
-        size_t discLen = 0;
-
-        discFrame[discLen++] = FLAG;
-        TRY(stuffFunc(addressField, discFrame, &discLen, sizeof(discFrame)));
-        TRY(stuffFunc(controlField, discFrame, &discLen, sizeof(discFrame)));
-        TRY(stuffFunc(bcc1, discFrame, &discLen, sizeof(discFrame)));
-        discFrame[discLen++] = FLAG;
+        unsigned char discFrame[5] = {FLAG, addressField, controlField, bcc1, FLAG};
+        size_t discLen = 5;
 
         if (writeBytesSerialPort(discFrame, discLen) != discLen)
         {
-            printf("Erro ao enviar UA\n");
+            printf("Erro ao enviar DISC\n");
             closeSerialPort();
             return -1;
         }
 
+        UnStuffState unStuffState2;
+        setupAlarm();
+
+        int tries2 = 0;
+        int gotUA = 0;
+
+        while (!gotUA && tries2 < nTries)
+        {
+            resetUnStuffState(&unStuffState2);
+            startAlarm(timeout);
+
+            State st = START;
+            unsigned char a2 = 0, c2 = 0;
+
+            while (st != STOP && alarmEnabled)
+            {
+                unsigned char b;
+                int res = unStuffByteFromSerial(&b, &unStuffState2);
+                if (res <= 0)
+                    continue;
+
+                switch (st)
+                {
+                case START:
+                    if (b == FLAG)
+                        st = FLAG_RCV;
+                    break;
+                case FLAG_RCV:
+                    if (b == ADDRESS_SENDER)
+                    {
+                        a2 = b;
+                        st = A_RCV;
+                    }
+                    else if (b != FLAG)
+                        st = START;
+                    break;
+                case A_RCV:
+                    c2 = b;
+                    if (b == UA)
+                        st = C_RCV;
+                    else if (b == FLAG)
+                        st = FLAG_RCV;
+                    else
+                        st = START;
+                    break;
+                case C_RCV:
+                    if (b == BCC1(a2, c2))
+                        st = BCC1_OK;
+                    else if (b == FLAG)
+                        st = FLAG_RCV;
+                    else
+                        st = START;
+                    break;
+                case BCC1_OK:
+                    if (b == FLAG)
+                        st = STOP;
+                    else
+                        st = START;
+                    break;
+                default:
+                    break;
+                }
+            }
+
+            if (st == STOP && a2 == ADDRESS_SENDER && c2 == UA)
+            {
+                gotUA = 1;
+                stopAlarm();
+                break;
+            }
+
+            stopAlarm();
+            tries2++;
+
+            writeBytesSerialPort(discFrame, discLen);
+        }
+
+        if (!gotUA)
+        {
+            printf("llclose (Rx): UA não recebido após %d tentativas\n", tries2);
+            closeSerialPort();
+            return -1;
+        }
+
+        closeSerialPort();
         return 0;
     }
-    return 0;
 }
