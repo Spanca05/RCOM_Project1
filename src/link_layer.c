@@ -851,9 +851,9 @@ int llclose()
 
         // Send UA final - supervision frames are NOT stuffed
         const unsigned char C_UA = UA;
-        const unsigned char B1_UA = BCC1(addressField, C_UA);
+        const unsigned char B1_UA = BCC1(ADDRESS_RECEIVER, C_UA);
 
-        unsigned char uaFrame[5] = {FLAG, addressField, C_UA, B1_UA, FLAG};
+        unsigned char uaFrame[5] = {FLAG,ADDRESS_RECEIVER, C_UA, B1_UA, FLAG};
 
         writeBytesSerialPort(uaFrame, 5);
 
@@ -974,7 +974,7 @@ int llclose()
                         st = FLAG_RCV;
                     break;
                 case FLAG_RCV:
-                    if (b == ADDRESS_SENDER)
+                    if (b == ADDRESS_RECEIVER)
                     {
                         a2 = b;
                         st = A_RCV;
@@ -1010,7 +1010,7 @@ int llclose()
                 }
             }
 
-            if (st == STOP && a2 == ADDRESS_SENDER && c2 == UA)
+            if (st == STOP && a2 == ADDRESS_RECEIVER && c2 == UA)
             {
                 gotUA = 1;
                 stopAlarm();
