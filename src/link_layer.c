@@ -79,7 +79,14 @@ void resetUnStuffState(UnStuffState *state)
     state->lastFromEscape = 0;
 }
 
-// TODO: Implementar sendSupervisionFrame para código ficar mais modular e se perceber melhor
+void createSupervisionFrame(unsigned char *sFrame, unsigned char A, unsigned char C)
+{
+    sFrame[0] = FLAG;
+    sFrame[1] = A;
+    sFrame[2] = C;
+    sFrame[3] = (unsigned char)(A ^ C);
+    sFrame[4] = FLAG;
+}
 
 ////////////////////////////////////////////////
 // LLOPEN
@@ -126,10 +133,10 @@ int llopen(LinkLayer connectionParameters)
     {
         const unsigned char addressField = ADDRESS_SENDER;
         const unsigned char controlField = SET;
-        const unsigned char bcc1 = BCC1(addressField, controlField);
 
         // Supervision frames are NOT stuffed
-        unsigned char setFrame[5] = {FLAG, addressField, controlField, bcc1, FLAG};
+        unsigned char setFrame[5];
+        createSupervisionFrame(setFrame, addressField, controlField);
         size_t setLen = 5;
 
         int tries = 0;
@@ -295,10 +302,11 @@ int llopen(LinkLayer connectionParameters)
 
         const unsigned char addressField = ADDRESS_RECEIVER;
         const unsigned char controlField = UA;
-        const unsigned char bcc1 = BCC1(addressField, controlField);
 
         // Supervision frames are NOT stuffed
-        unsigned char uaFrame[5] = {FLAG, addressField, controlField, bcc1, FLAG};
+        unsigned char uaFrame[5];
+        createSupervisionFrame(uaFrame, addressField, controlField);
+
         size_t uaLen = 5;
 
         if (writeBytesSerialPort(uaFrame, uaLen) != uaLen)
@@ -729,7 +737,7 @@ int llread(unsigned char *packet)
                         printf("%02X ", responseFrame[i]);
                     }
                     printf("\n");
-                    
+
                     int written = writeBytesSerialPort(responseFrame, 5);
                     printf("Bytes written: %d\n", written);
                 }
@@ -764,10 +772,10 @@ int llclose()
     {
         const unsigned char addressField = ADDRESS_SENDER;
         const unsigned char controlField = DISC;
-        const unsigned char bcc1 = BCC1(addressField, controlField);
 
         // Supervision frames are NOT stuffed
-        unsigned char discFrame[5] = {FLAG, addressField, controlField, bcc1, FLAG};
+        unsigned char discFrame[5];
+        createSupervisionFrame(discFrame, addressField, controlField);
         size_t discLen = 5;
 
         int tries = 0;
@@ -864,10 +872,9 @@ int llclose()
 
         // Send UA final - supervision frames are NOT stuffed
         const unsigned char C_UA = UA;
-        const unsigned char B1_UA = BCC1(ADDRESS_RECEIVER, C_UA);
 
-        unsigned char uaFrame[5] = {FLAG, ADDRESS_RECEIVER, C_UA, B1_UA, FLAG};
-
+        unsigned char uaFrame[5];
+        createSupervisionFrame(uaFrame, ADDRESS_RECEIVER, C_UA);
         writeBytesSerialPort(uaFrame, 5);
 
         closeSerialPort();
@@ -947,9 +954,9 @@ int llclose()
         /* Send DISC back - supervision frames are NOT stuffed */
         const unsigned char addressField = ADDRESS_RECEIVER;
         const unsigned char controlField = DISC;
-        const unsigned char bcc1 = BCC1(addressField, controlField);
 
-        unsigned char discFrame[5] = {FLAG, addressField, controlField, bcc1, FLAG};
+        unsigned char discFrame[5];
+        createSupervisionFrame(discFrame, addressField, controlField);
         size_t discLen = 5;
 
         if (writeBytesSerialPort(discFrame, discLen) != discLen)
