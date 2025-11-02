@@ -1,5 +1,4 @@
 // Application layer protocol implementation
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,7 +70,6 @@ unsigned char *getDataPacket(unsigned char *buf, const size_t bufSize, size_t *p
     packet[index++] = bufSize & 0xFF;        // L1: byte menos significativo
 
     memcpy(&packet[index], buf, bufSize);
-    index += bufSize;
 
     *packetSize = size;
     return packet;
@@ -110,7 +108,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         unsigned char *content = getData(file, fileSize);
         if (!content)
         {
-            perror("malloc content");
+            perror("Malloc content");
             fclose(file);
             llclose();
             return;
@@ -121,15 +119,18 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         unsigned char *startControlPacket = getControlPacket(1, filename, fileSize, &startControlPacketSize);
         if (!startControlPacket)
         {
+            perror("Start packet");
             free(content);
             fclose(file);
             llclose();
             return;
         }
+
         int ok = llwrite(startControlPacket, (int)startControlPacketSize);
         free(startControlPacket);
         if (ok < 0)
         {
+            perror("llwrite start packet");
             llclose();
             fclose(file);
             return;
@@ -140,7 +141,6 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         unsigned char *dataPacket;
         size_t dataPacketSize;
         long int bytesLeft = fileSize;
-
         unsigned char *contentPtr = content;
 
         // Data packet adds 3 bytes (type + L2 + L1), so limit actual data to keep total <= 1000
@@ -178,7 +178,6 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
 
             int wr = llwrite(dataPacket, (int)dataPacketSize);
             free(dataPacket);
-
             if (wr < 0)
             {
                 fprintf(stderr, "llwrite failed - aborting session.\n");
@@ -197,12 +196,21 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         // Send END Control Packet
         size_t endControlPacketSize;
         unsigned char *endControlPacket = getControlPacket(3, filename, fileSize, &endControlPacketSize);
+        if (!endControlPacket)
+        {
+            perror("End packet");
+            fclose(file);
+            llclose();
+            return;
+        }
+
         ok = llwrite(endControlPacket, (int)endControlPacketSize);
         free(endControlPacket);
         if (ok < 0)
         {
-            llclose();
+            perror("llwrite end packet");
             fclose(file);
+            llclose();
             return;
         }
 
@@ -275,12 +283,14 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
                             expectedFileSize = fsz;
                         }
                     }
+
                     else if (paramType == 1)
                     {
                         /* filename */
                         size_t nameLen = paramLen;
                         if (nameLen >= sizeof(remoteFilename))
                             nameLen = sizeof(remoteFilename) - 1;
+
                         memcpy(remoteFilename, &packetBuf[idx], nameLen);
                         remoteFilename[nameLen] = '\0';
                     }
@@ -300,11 +310,13 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
                         size_t baseLen = (size_t)(dot - remoteFilename);
                         snprintf(outPath, sizeof(outPath), "%.*s-received%s", (int)baseLen, remoteFilename, dot);
                     }
+
                     else
                     {
                         snprintf(outPath, sizeof(outPath), "%s-received", remoteFilename);
                     }
                 }
+
                 else
                 {
                     snprintf(outPath, sizeof(outPath), "%s-received", filename);
@@ -317,6 +329,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
                     llclose();
                     return;
                 }
+
                 totalWritten = 0;
                 haveStart = 1;
                 fprintf(stderr, "Receiving file '%s' size=%ld bytes\n", outPath, expectedFileSize);
@@ -329,6 +342,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
 
                 unsigned char l2 = packetBuf[1];
                 unsigned char l1 = packetBuf[2];
+
                 int dataLen = ((int)l2 << 8) | (int)l1;
                 if (dataLen < 0 || dataLen > MAX_PAYLOAD_SIZE)
                     continue; /* invalid */
@@ -352,6 +366,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
                         llclose();
                         return;
                     }
+
                     haveStart = 1;
                 }
 
@@ -364,11 +379,14 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
                         fclose(outFile);
                         outFile = NULL;
                     }
+
                     if (outPath[0])
                         remove(outPath);
+
                     llclose();
                     return;
                 }
+
                 fflush(outFile);
                 totalWritten += (long)written;
             }
@@ -379,6 +397,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
                 if (totalWritten != expectedFileSize)
                 {
                     fprintf(stderr, "Size mismatch: got %ld, expected %ld\n", totalWritten, expectedFileSize);
+                    
                     if (outFile)
                     {
                         fclose(outFile);
@@ -393,6 +412,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
                     fclose(outFile);
                     outFile = NULL;
                 }
+
                 fprintf(stderr, "File transfer complete, %ld bytes written\n", totalWritten);
 
                 if (expectedFileSize > 0 && totalWritten != expectedFileSize)
