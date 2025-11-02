@@ -84,7 +84,7 @@ void createSupervisionFrame(unsigned char *sFrame, unsigned char A, unsigned cha
     sFrame[0] = FLAG;
     sFrame[1] = A;
     sFrame[2] = C;
-    sFrame[3] = (unsigned char)(A ^ C);
+    sFrame[3] = (unsigned char)BCC1(A, C);
     sFrame[4] = FLAG;
 }
 
