@@ -36,7 +36,9 @@
 struct Parameters
 {
     int cableOn;
-    double byteER; // Byte error rate
+    int cableOnTx2Rx; // TRUE if Tx->Rx direction is enabled
+    int cableOnRx2Tx; // TRUE if Rx->Tx direction is enabled
+    double byteER;    // Byte error rate
     struct timespec byteDelay;
     unsigned long propDelay; // Desired propagation delay in usec
     int bufSize;             // Dimensioned to enforce the propagation delay
@@ -51,6 +53,8 @@ struct Parameters
 
 struct Parameters par = {
     .cableOn = TRUE,
+    .cableOnTx2Rx = TRUE,
+    .cableOnRx2Tx = TRUE,
     .byteER = 0.0,
     .propDelay = 0,
     .tx2rx = NULL,
@@ -235,6 +239,8 @@ void help()
            "--- help         : show this help\n"
            "--- on           : connect the cable and data is exchanged (default state)\n"
            "--- off          : disconnect the cable disabling data to be exchanged\n"
+           "--- off tx/on tx : disable/enable Tx->Rx direction only (useful to drop ACKs)\n"
+           "--- off rx/on rx : disable/enable Rx->Tx direction only\n"
            "--- ber <ber>    : add noise to data bits at a specified BER (default=0)\n"
            "--- baud <rate>  : set baud rate, between 1200 and 115200 (default=9600)\n"
            "                   note that 10 bits are sent per byte (8-N-1)\n"
@@ -254,11 +260,15 @@ int main(int argc, char *argv[])
 {
     printf("\n");
 
-    system("socat -dd PTY,link=" TXDEV ",mode=777,raw,echo=0 PTY,link=" TX_EMULATOR ",mode=777,raw,echo=0 &");
+    /* Start socat without debug flags and redirect its output to /dev/null
+        to avoid constant socat debug printing in the terminal. */
+    system("socat PTY,link=" TXDEV ",mode=777,raw,echo=0 PTY,link=" TX_EMULATOR ",mode=777,raw,echo=0 >/dev/null 2>&1 &");
     sleep(1);
     printf("\n");
 
-    system("socat -dd PTY,link=" RXDEV ",mode=777,raw,echo=0 PTY,link=" RX_EMULATOR ",mode=777,raw,echo=0 &");
+    /* Start socat without debug flags and redirect its output to /dev/null
+        to avoid constant socat debug printing in the terminal. */
+    system("socat PTY,link=" RXDEV ",mode=777,raw,echo=0 PTY,link=" RX_EMULATOR ",mode=777,raw,echo=0 >/dev/null 2>&1 &");
     sleep(1);
 
     help();
@@ -374,25 +384,29 @@ int main(int argc, char *argv[])
         par.tx2rxIdx = (par.tx2rxIdx + 1) % par.bufSize;
         par.rx2txIdx = (par.rx2txIdx + 1) % par.bufSize;
 
-        if (par.cableOn)
+        /* Write bytes according to global cable state and per-direction flags */
+        if (par.cableOn && par.cableOnTx2Rx)
         {
             if (par.tx2rxValid[par.tx2rxIdx])
             {
-                // Add error, if applicable
+                /* Add error, if applicable */
                 if (par.byteER != 0.0 && (double)rand() / (double)RAND_MAX < par.byteER)
                 {
-                    // At most one wrong bit per byte, good enough if ber < 0.02
+                    /* At most one wrong bit per byte, good enough if ber < 0.02 */
                     par.tx2rx[par.tx2rxIdx] ^= (char)1 << rand() % 8;
                 }
                 write(fdRx, par.tx2rx + par.tx2rxIdx, 1);
             }
+        }
 
+        if (par.cableOn && par.cableOnRx2Tx)
+        {
             if (par.rx2txValid[par.rx2txIdx])
             {
-                // Add error, if applicable
+                /* Add error, if applicable */
                 if (par.byteER != 0.0 && (double)rand() / (double)RAND_MAX < par.byteER)
                 {
-                    // At most one wrong bit per byte, good enough if ber < 0.02
+                    /* At most one wrong bit per byte, good enough if ber < 0.02 */
                     par.rx2tx[par.rx2txIdx] ^= (char)1 << rand() % 8;
                 }
                 write(fdTx, par.rx2tx + par.rx2txIdx, 1);
@@ -452,6 +466,34 @@ int main(int argc, char *argv[])
             {
                 printf("CONNECTION ON\n");
                 par.cableOn = TRUE;
+            }
+            else if (strcmp(rxStdin, "off tx") == 0)
+            {
+                printf("CONNECTION TX->RX OFF\n");
+                par.cableOnTx2Rx = FALSE;
+                if (par.cableOn && par.logfile != NULL)
+                {
+                    fputs("CABLE TX->RX OFF\n", par.logfile);
+                }
+            }
+            else if (strcmp(rxStdin, "on tx") == 0)
+            {
+                printf("CONNECTION TX->RX ON\n");
+                par.cableOnTx2Rx = TRUE;
+            }
+            else if (strcmp(rxStdin, "off rx") == 0)
+            {
+                printf("CONNECTION RX->TX OFF\n");
+                par.cableOnRx2Tx = FALSE;
+                if (par.cableOn && par.logfile != NULL)
+                {
+                    fputs("CABLE RX->TX OFF\n", par.logfile);
+                }
+            }
+            else if (strcmp(rxStdin, "on rx") == 0)
+            {
+                printf("CONNECTION RX->TX ON\n");
+                par.cableOnRx2Tx = TRUE;
             }
             else if (strncmp(rxStdin, "ber ", 4) == 0)
             {

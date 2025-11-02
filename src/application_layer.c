@@ -343,9 +343,11 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
                         snprintf(outPath, sizeof(outPath), "%s-received", filename);
                     }
 
-                    outFile = fopen(filename, "wb");
+                    /* Open using the computed output path (outPath) so received bytes
+                       go to the intended "-received" filename when no START packet
+                       was received. */
+                    outFile = fopen(outPath, "wb");
 
-                    /* Haven't received START; open with provided filename */
                     if (!outFile)
                     {
                         perror("fopen (rx fallback)");
