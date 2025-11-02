@@ -70,6 +70,7 @@ unsigned char *getDataPacket(unsigned char *buf, const size_t bufSize, size_t *p
     packet[index++] = bufSize & 0xFF;        // L1: byte menos significativo
 
     memcpy(&packet[index], buf, bufSize);
+    index += bufSize;
 
     *packetSize = size;
     return packet;
