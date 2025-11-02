@@ -95,32 +95,6 @@ int llopen(LinkLayer connectionParameters)
 {
     nTries = connectionParameters.nRetransmissions;
     timeout = connectionParameters.timeout;
-
-    // Allow runtime override via environment for stress tests
-    const char *envRetries = getenv("LL_RETRIES");
-    if (envRetries && *envRetries)
-    {
-        char *endp = NULL;
-        long v = strtol(envRetries, &endp, 10);
-        if (endp != envRetries && v > 0 && v <= 1000)
-        {
-            nTries = (int)v;
-            fprintf(stderr, "[LL] Using LL_RETRIES=%d (overriding default %d)\n", nTries, connectionParameters.nRetransmissions);
-        }
-    }
-
-    const char *envTimeout = getenv("LL_TIMEOUT");
-    if (envTimeout && *envTimeout)
-    {
-        char *endp = NULL;
-        long v = strtol(envTimeout, &endp, 10);
-        if (endp != envTimeout && v > 0 && v <= 60)
-        {
-            timeout = (int)v;
-            fprintf(stderr, "[LL] Using LL_TIMEOUT=%d seconds (overriding default %d)\n", timeout, connectionParameters.timeout);
-        }
-    }
-
     storedRole = connectionParameters.role;
 
     if (openSerialPort(connectionParameters.serialPort, connectionParameters.baudRate) == -1)
