@@ -1,5 +1,4 @@
 // Link layer protocol implementation
-
 #include "link_layer.h"
 #include "serial_port.h"
 #include "alarm.h"
@@ -33,6 +32,7 @@ static int stuffFunc(unsigned char inputByte, unsigned char *outBuffer, size_t *
         outBuffer[(*outLen)++] = ESC;
         outBuffer[(*outLen)++] = (unsigned char)(inputByte ^ 0x20); // O XOR retorna um signed char?
     }
+
     else
     {
         if ((*outLen) + 1 > outCap)
@@ -101,6 +101,7 @@ int llopen(LinkLayer connectionParameters)
             fprintf(stderr, "[LL] Using LL_RETRIES=%d (overriding default %d)\n", nTries, connectionParameters.nRetransmissions);
         }
     }
+
     const char *envTimeout = getenv("LL_TIMEOUT");
     if (envTimeout && *envTimeout)
     {
@@ -214,6 +215,7 @@ int llopen(LinkLayer connectionParameters)
                 stopAlarm();
                 break;
             }
+
             else
                 tries++;
         }
@@ -347,6 +349,7 @@ int llwrite(const unsigned char *buf, int bufSize)
 
     if (frameLen + 1 > maxFrameSize)
         return -1;
+
     frame[frameLen++] = FLAG;
 
     setupAlarm();
@@ -360,6 +363,7 @@ int llwrite(const unsigned char *buf, int bufSize)
     {
         printf("[llwrite] Attempt %d (attemptCount=%d, nTries=%d)\n", attemptCount + 1, attemptCount, nTries);
         resetUnStuffState(&unStuffState);
+
         if (writeBytesSerialPort(frame, frameLen) != frameLen)
         {
             // write failure -> try again without consuming a retry (optional)
@@ -386,6 +390,7 @@ int llwrite(const unsigned char *buf, int bufSize)
             int unStuffRes = unStuffByteFromSerial(&rxByteDeStuffed, &unStuffState);
             if (unStuffRes <= 0)
                 continue;
+
             rxByte = rxByteDeStuffed;
 
             switch (state)
@@ -450,6 +455,7 @@ int llwrite(const unsigned char *buf, int bufSize)
                 s_ns ^= 1;
                 return bufSize;
             }
+
             if (lastControl == rejExpected)
             {
                 // Receiver detected error -> retransmit WITHOUT consuming attempt
@@ -458,11 +464,13 @@ int llwrite(const unsigned char *buf, int bufSize)
                 printf("[llwrite] REJ received, retransmitting without consuming retry\n");
                 continue;
             }
+
             if (lastControl == DISC)
             {
                 // receiver closing unexpectedly
                 return -1;
             }
+
             // other control (e.g., UA or unexpected RR): treat as non-useful response
             attemptCount++;
             continue;
@@ -689,6 +697,7 @@ int llread(unsigned char *packet)
 
                         return (int)(dataIndex - 1);
                     }
+
                     else
                     {
                         unsigned char rr_dup = (expected_ns == 0) ? RR0 : RR1;
@@ -703,6 +712,7 @@ int llread(unsigned char *packet)
                         break;
                     }
                 }
+
                 else
                 {
                     // Either BCC2 error or wrong sequence number - reject frame
@@ -719,6 +729,7 @@ int llread(unsigned char *packet)
                         printf("%02X ", responseFrame[i]);
                     }
                     printf("\n");
+                    
                     int written = writeBytesSerialPort(responseFrame, 5);
                     printf("Bytes written: %d\n", written);
                 }
@@ -726,11 +737,13 @@ int llread(unsigned char *packet)
                 state = START;
                 break;
             }
+
             else
             {
                 // Regular data byte
                 if (dataIndex < sizeof(dataBuf))
                     dataBuf[dataIndex++] = rxByte;
+
                 else
                 {
                     // Buffer overflow - discard frame
@@ -804,7 +817,7 @@ int llclose()
                     break;
 
                 case A_RCV:
-                    lastC = byte; //! Porque é que é aqui e não dentro do if?
+                    lastC = byte;
                     if (byte == DISC)
                         state = C_RCV;
                     else if (byte == FLAG)
@@ -853,7 +866,7 @@ int llclose()
         const unsigned char C_UA = UA;
         const unsigned char B1_UA = BCC1(ADDRESS_RECEIVER, C_UA);
 
-        unsigned char uaFrame[5] = {FLAG,ADDRESS_RECEIVER, C_UA, B1_UA, FLAG};
+        unsigned char uaFrame[5] = {FLAG, ADDRESS_RECEIVER, C_UA, B1_UA, FLAG};
 
         writeBytesSerialPort(uaFrame, 5);
 
