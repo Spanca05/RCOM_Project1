@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "application_layer.h"
 #include "link_layer.h"
 
@@ -97,6 +98,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
 
     if (llrole == LlTx)
     {
+        time_t t1 = time(NULL);
         FILE *file = fopen(filename, "rb");
         if (!file)
         {
@@ -142,6 +144,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
         unsigned char *dataPacket;
         size_t dataPacketSize;
         long int bytesLeft = fileSize;
+        printf("filesize: %ld \n",fileSize);
         unsigned char *contentPtr = content;
 
         // Data packet adds 3 bytes (type + L2 + L1), so limit actual data to keep total <= 1000
@@ -214,8 +217,11 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
             llclose();
             return;
         }
-
+        time_t t2 = time(NULL);
         fclose(file);
+
+        printf("Transfer took %.2f seconds \n", difftime(t2,t1));
+        
     }
     else
     {
@@ -400,7 +406,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate,
                 if (totalWritten != expectedFileSize)
                 {
                     fprintf(stderr, "Size mismatch: got %ld, expected %ld\n", totalWritten, expectedFileSize);
-                    
+
                     if (outFile)
                     {
                         fclose(outFile);
